@@ -1,0 +1,11 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+compressai>=1.2.6
+wandb>=0.16
+pytorch-msssim>=1.0.0
+PyYAML>=6.0
+Pillow>=10.0
+tqdm>=4.66
+numpy>=1.24,<2.0
+

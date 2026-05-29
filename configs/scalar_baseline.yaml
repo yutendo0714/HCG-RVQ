@@ -1,0 +1,41 @@
+run_name: scalar_baseline_lambda0035
+seed: 1234
+output_dir: experiments
+
+model:
+  N: 192
+  M: 320
+
+quantizer:
+  type: scalar
+
+loss:
+  lambda_rd: 0.0035
+  beta_commit: 0.0
+  rho_gate: 0.0
+
+data:
+  train_roots:
+    - /dpl/openimages
+  patch_size: 256
+  batch_size: 8
+  num_workers: 4
+  max_train_images:
+
+eval:
+  root: /dpl/kodak
+  num_workers: 2
+
+train:
+  epochs: 100
+  lr: 0.0001
+  aux_lr: 0.001
+  log_interval: 50
+  clip_max_norm: 1.0
+
+wandb:
+  enabled: true
+  project: HCG-RVQ
+  name: scalar_baseline_lambda0035
+  mode: online
+
