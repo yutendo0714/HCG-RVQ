@@ -40,14 +40,32 @@ def main() -> None:
     data_cfg = config.get("eval", {})
     root = args.data_root or data_cfg.get("root", "/dpl/kodak")
 
-    dataset = ImageFolderDataset([root], patch_size=None, training=False, max_images=data_cfg.get("max_images"))
+    dataset = ImageFolderDataset(
+        [root],
+        patch_size=data_cfg.get("patch_size"),
+        training=False,
+        max_images=data_cfg.get("max_images"),
+        start_index=data_cfg.get("start_index", 0),
+    )
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=data_cfg.get("num_workers", 2))
     model = build_model(config).to(device)
     if args.checkpoint:
         checkpoint = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(checkpoint["state_dict"])
     model.eval()
-    criterion = RateDistortionLoss(**config.get("loss", {}))
+    eval_loss_cfg = dict(config.get("loss", {}))
+    eval_loss_cfg["rho_householder_reliability_teacher"] = 0.0
+    eval_loss_cfg["rho_householder_residual_selector_teacher"] = 0.0
+    eval_loss_cfg["rho_householder_residual_selector_noop"] = 0.0
+    for anchor_name in (
+        "rho_anchor_mu",
+        "rho_anchor_log_s",
+        "rho_anchor_u",
+        "rho_anchor_y_hat",
+        "rho_anchor_selected_distortion_margin",
+    ):
+        eval_loss_cfg[anchor_name] = 0.0
+    criterion = RateDistortionLoss(**eval_loss_cfg)
 
     totals: dict[str, list[float]] = defaultdict(list)
     with torch.no_grad():
