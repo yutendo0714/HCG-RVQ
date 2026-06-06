@@ -21,15 +21,20 @@ class ImageFolderDataset(Dataset):
         patch_size: int | None = None,
         training: bool = True,
         max_images: int | None = None,
+        start_index: int = 0,
+        return_path: bool = False,
     ) -> None:
         self.roots = [Path(root) for root in roots]
         self.patch_size = patch_size
         self.training = training
+        self.return_path = return_path
         paths: list[Path] = []
         for root in self.roots:
             if root.exists():
                 paths.extend(p for p in root.rglob("*") if p.suffix.lower() in IMG_EXTENSIONS)
         self.paths = sorted(paths)
+        if start_index:
+            self.paths = self.paths[int(start_index):]
         if max_images is not None:
             self.paths = self.paths[:max_images]
         if not self.paths:
@@ -55,9 +60,12 @@ class ImageFolderDataset(Dataset):
             top = max((h - size) // 2, 0)
         return image.crop((left, top, left + size, top + size))
 
-    def __getitem__(self, index: int) -> torch.Tensor:
+    def __getitem__(self, index: int) -> torch.Tensor | dict[str, torch.Tensor | str]:
         with Image.open(self.paths[index]) as image:
             image = image.convert("RGB")
             image = self._crop(image)
-            return TF.to_tensor(image)
+            tensor = TF.to_tensor(image)
+        if self.return_path:
+            return {"image": tensor, "path": str(self.paths[index])}
+        return tensor
 
