@@ -1,0 +1,119 @@
+run_name: pilot_hcg_rvq_h_gate025_risk_inv_detach_s044_min090_local_delta_cap080_rho1_excessrisk090_betacommit005_e088sel_residualselector_localdelta_t0451_rho025_distmargin_m020_rho250_keep005_yhatanchor50_deadzone016_from_beta005_g64_l1_k128_lambda0035_seed1234
+seed: 1234
+output_dir: experiments
+model:
+  N: 192
+  M: 320
+quantizer:
+  type: hcg_rvq_h
+  group_size: 64
+  num_stages: 1
+  codebook_size: 128
+  codebook_init_scale: 0.02
+  householder_strength: 1.0
+  householder_gate_enabled: true
+  householder_gate_max: 0.45
+  householder_gate_init: 0.25
+  householder_gate_risk_enabled: true
+  householder_gate_risk_center: 0.44
+  householder_gate_risk_sharpness: 12.0
+  householder_gate_risk_min: 0.9
+  householder_gate_risk_invert: true
+  householder_gate_risk_detach: true
+  householder_gate_residual_selector_enabled: true
+  householder_gate_residual_selector_max: 0.5
+  householder_gate_residual_selector_bias: -4.0
+  householder_gate_residual_selector_deadzone_threshold: 0.016
+  householder_gate_residual_selector_detach: true
+hyper_conditioning:
+  scale_min: 0.05
+  scale_max: 10.0
+entropy_index:
+  enabled: true
+  hidden_channels: 192
+stage_gate:
+  enabled: false
+loss:
+  lambda_rd: 0.0035
+  beta_commit: 0.05
+  rho_gate: 0.0
+  rho_householder_delta_local_cap: 0.0
+  householder_delta_local_cap: 0.08
+  householder_delta_local_cap_use_risk: true
+  householder_delta_local_cap_detach_risk: true
+  householder_delta_local_cap_risk_power: 1.0
+  householder_delta_local_cap_risk_offset: 0.9
+  householder_delta_local_cap_risk_normalize: true
+  rho_householder_residual_selector_teacher: 0.25
+  householder_residual_selector_teacher_target: e088_decoder_safe_selected_previous_local
+  householder_residual_selector_teacher_weight: e088_decoder_safe_confidence_weight
+  householder_residual_selector_teacher_use_image_mean: false
+  householder_residual_selector_teacher_local_weight_source: householder_delta_rms_map
+  householder_residual_selector_teacher_local_weight_threshold: 0.045151
+  householder_residual_selector_teacher_local_weight_sharpness: 80.0
+  householder_residual_selector_teacher_local_weight_high: true
+  householder_residual_selector_teacher_local_weight_min: 0.2
+  householder_residual_selector_teacher_local_weight_detach: true
+  rho_anchor_y_hat: 50.0
+  rho_anchor_selected_distortion_margin: 2.5
+  anchor_selected_distortion_target: e088_decoder_safe_selected_previous_local
+  anchor_selected_distortion_weight: e088_decoder_safe_confidence_weight
+  anchor_selected_distortion_margin: 0.020
+  anchor_selected_distortion_keep_margin: 0.0
+  anchor_selected_distortion_keep_weight: 0.05
+  anchor_selected_distortion_squared: true
+data:
+  train_roots:
+  - /dpl/openimages/open-images-v6/train/data
+  patch_size: 256
+  batch_size: 8
+  num_workers: 4
+  max_train_images: 4096
+  start_index: 8192
+eval:
+  root: /dpl/kodak
+  num_workers: 2
+train:
+  epochs: 10
+  lr: 0.0001
+  aux_lr: 0.001
+  log_interval: 20
+  clip_max_norm: 1.0
+  lr_milestones: []
+  lr_gamma: 0.1
+  save_interval_steps: 250
+  max_steps: 250
+  init_model: experiments/pilot_hcg_rvq_h_gate025_risk_inv_detach_s044_min090_local_delta_cap080_rho1_excessrisk090_betacommit005_after250_frozen_g64_l1_k128_lambda0035_seed1234/checkpoint_step_500.pth.tar
+  freeze_prefixes:
+  - global_mu
+  - global_log_s
+  - entropy_bottleneck
+  - g_a
+  - g_s
+  - h_a
+  - h_s
+  - scalar_head
+  - mu_head
+  - log_s_head
+  - householder_head
+  - householder_gate_head
+  - householder_reliability_head
+  - gate_head
+  - rvq
+  - index_entropy_model
+  anchor_model: experiments/pilot_hcg_rvq_h_gate025_risk_inv_detach_s044_min090_local_delta_cap080_rho1_excessrisk090_betacommit005_after250_frozen_g64_l1_k128_lambda0035_seed1234/checkpoint_step_500.pth.tar
+  anchor_config: configs/pilot_hcg_rvq_h_gate025_risk_inv_detach_s044_min090_local_delta_cap080_rho1_excessrisk090_betacommit005_after250_frozen_seed1234.yaml
+  teacher_labels:
+    path: experiments/analysis/e088_decoder_safe_selector_teacher_labels_transfer8192.csv
+    path_column: path
+    target_column: e088_decoder_safe_selected_previous_local
+    target_name: e088_decoder_safe_selected_previous_local
+    weight_column: e088_decoder_safe_confidence_weight
+    weight_name: e088_decoder_safe_confidence_weight
+    seed_column: seed
+    filter_current_seed: true
+wandb:
+  enabled: false
+  project: HCG-RVQ
+  name: pilot_hcg_rvq_h_gate025_risk_inv_detach_s044_min090_local_delta_cap080_rho1_excessrisk090_betacommit005_e088sel_residualselector_localdelta_t0451_rho025_distmargin_m020_rho250_keep005_yhatanchor50_from_beta005_g64_l1_k128_lambda0035_seed1234
+  mode: online

@@ -1,0 +1,72 @@
+run_name: pilot_hcg_rvq_h_gate025_risk_inv_detach_s044_min090_local_delta_cap080_rho1_excessrisk090_frozen_g64_l1_k128_lambda0035_seed3456
+seed: 3456
+output_dir: experiments
+model:
+  N: 192
+  M: 320
+quantizer:
+  type: hcg_rvq_h
+  group_size: 64
+  num_stages: 1
+  codebook_size: 128
+  codebook_init_scale: 0.02
+  householder_strength: 1.0
+  householder_gate_enabled: true
+  householder_gate_max: 0.45
+  householder_gate_init: 0.25
+  householder_gate_risk_enabled: true
+  householder_gate_risk_center: 0.44
+  householder_gate_risk_sharpness: 12.0
+  householder_gate_risk_min: 0.90
+  householder_gate_risk_invert: true
+  householder_gate_risk_detach: true
+hyper_conditioning:
+  scale_min: 0.05
+  scale_max: 10.0
+entropy_index:
+  enabled: true
+  hidden_channels: 192
+stage_gate:
+  enabled: false
+loss:
+  lambda_rd: 0.0035
+  beta_commit: 0.01
+  rho_gate: 0.0
+  rho_householder_delta_local_cap: 1.0
+  householder_delta_local_cap: 0.080
+  householder_delta_local_cap_use_risk: true
+  householder_delta_local_cap_detach_risk: true
+  householder_delta_local_cap_risk_power: 1.0
+  householder_delta_local_cap_risk_offset: 0.90
+  householder_delta_local_cap_risk_normalize: true
+data:
+  train_roots:
+  - /dpl/openimages/open-images-v6/train/data
+  patch_size: 256
+  batch_size: 8
+  num_workers: 4
+  max_train_images: 4096
+eval:
+  root: /dpl/kodak
+  num_workers: 2
+train:
+  epochs: 10
+  lr: 5.0e-05
+  aux_lr: 0.001
+  log_interval: 20
+  clip_max_norm: 1.0
+  lr_milestones: []
+  lr_gamma: 0.1
+  save_interval_steps: 250
+  max_steps: 500
+  init_model: experiments/init/pilot_hcg_rvq_h_g64_l1_k128_from_scalar.pth.tar
+  freeze_prefixes:
+  - g_a
+  - h_a
+  - h_s
+  - entropy_bottleneck
+wandb:
+  enabled: false
+  project: HCG-RVQ
+  name: pilot_hcg_rvq_h_gate025_risk_inv_detach_s044_min090_local_delta_cap080_rho1_excessrisk090_frozen_g64_l1_k128_lambda0035_seed3456
+  mode: online

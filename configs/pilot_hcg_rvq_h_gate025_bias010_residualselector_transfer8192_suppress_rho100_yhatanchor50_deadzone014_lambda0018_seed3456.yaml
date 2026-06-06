@@ -1,0 +1,96 @@
+run_name: pilot_hcg_rvq_h_gate025_bias010_residualselector_transfer8192_suppress_rho100_yhatanchor50_deadzone014_g64_l1_k128_lambda0018_seed3456
+seed: 3456
+output_dir: experiments
+model:
+  N: 192
+  M: 320
+quantizer:
+  type: hcg_rvq_h
+  group_size: 64
+  num_stages: 1
+  codebook_size: 128
+  codebook_init_scale: 0.02
+  householder_strength: 1.0
+  householder_bias_init_scale: 0.01
+  householder_gate_enabled: true
+  householder_gate_max: 0.45
+  householder_gate_init: 0.25
+  householder_gate_residual_selector_enabled: true
+  householder_gate_residual_selector_max: 0.50
+  householder_gate_residual_selector_bias: -4.0
+  householder_gate_residual_selector_deadzone_threshold: 0.014
+  householder_gate_residual_selector_detach: true
+hyper_conditioning:
+  scale_min: 0.05
+  scale_max: 10.0
+entropy_index:
+  enabled: true
+  hidden_channels: 192
+stage_gate:
+  enabled: false
+loss:
+  lambda_rd: 0.0018
+  beta_commit: 0.01
+  rho_gate: 0.0
+  rho_householder_residual_selector_teacher: 1.0
+  householder_residual_selector_teacher_target: householder_reliability_suppress
+  householder_residual_selector_teacher_weight: householder_reliability_weight_margin_balanced
+  householder_residual_selector_teacher_use_image_mean: true
+  rho_anchor_y_hat: 50.0
+data:
+  train_roots:
+  - /dpl/openimages/open-images-v6/train/data
+  start_index: 8192
+  patch_size: 256
+  batch_size: 8
+  num_workers: 4
+  max_train_images: 4096
+eval:
+  root: /dpl/kodak
+  num_workers: 2
+train:
+  epochs: 10
+  lr: 1.0e-04
+  aux_lr: 0.001
+  log_interval: 20
+  clip_max_norm: 1.0
+  lr_milestones: []
+  lr_gamma: 0.1
+  save_interval_steps: 250
+  max_steps: 250
+  init_model: experiments/pilot_hcg_rvq_h_gate025_bias010_frozen_g64_l1_k128_lambda0018_seed3456/checkpoint_step_500.pth.tar
+  init_skip_prefixes:
+  - householder_residual_selector_head
+  freeze_prefixes:
+  - global_mu
+  - global_log_s
+  - entropy_bottleneck
+  - g_a
+  - g_s
+  - h_a
+  - h_s
+  - scalar_head
+  - mu_head
+  - log_s_head
+  - householder_head
+  - householder_gate_head
+  - householder_reliability_head
+  - gate_head
+  - rvq
+  - index_entropy_model
+  anchor_model: experiments/pilot_hcg_rvq_h_gate025_bias010_frozen_g64_l1_k128_lambda0018_seed3456/checkpoint_step_500.pth.tar
+  anchor_config: configs/pilot_hcg_rvq_h_gate025_bias010_frozen_lambda0018_seed3456.yaml
+  teacher_labels:
+    path: experiments/analysis/e146_lowrate_bias010_transfer8192_reliability_teacher_labels.csv
+    path_column: path
+    target_column: householder_reliability_suppress
+    target_name: householder_reliability_suppress
+    weight_column: householder_reliability_weight_margin_balanced
+    weight_name: householder_reliability_weight_margin_balanced
+    seed_column: seed
+    filter_current_seed: true
+wandb:
+  enabled: false
+  project: HCG-RVQ
+  name: pilot_hcg_rvq_h_gate025_bias010_residualselector_transfer8192_suppress_rho100_yhatanchor50_deadzone014_g64_l1_k128_lambda0018_seed3456
+  mode: online

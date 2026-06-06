@@ -1,5 +1,5 @@
-run_name: scalar_baseline_lambda0035
-seed: 1234
+run_name: pilot_scalar_baseline_lambda0018_seed2345
+seed: 2345
 output_dir: experiments
 model:
   N: 192
@@ -7,7 +7,7 @@ model:
 quantizer:
   type: scalar
 loss:
-  lambda_rd: 0.0035
+  lambda_rd: 0.0018
   beta_commit: 0.0
   rho_gate: 0.0
 data:
@@ -16,22 +16,22 @@ data:
   patch_size: 256
   batch_size: 8
   num_workers: 4
-  max_train_images: null
+  max_train_images: 4096
 eval:
   root: /dpl/kodak
   num_workers: 2
 train:
-  epochs: 50
+  epochs: 10
   lr: 0.0001
   aux_lr: 0.001
-  log_interval: 50
+  log_interval: 20
   clip_max_norm: 1.0
-  lr_milestones:
-  - 46
+  lr_milestones: []
   lr_gamma: 0.1
-  save_interval_steps: 5000
+  save_interval_steps: 250
+  max_steps: 500
 wandb:
-  enabled: true
+  enabled: false
   project: HCG-RVQ
-  name: scalar_baseline_lambda0035
+  name: pilot_scalar_baseline_lambda0018_seed2345
   mode: online

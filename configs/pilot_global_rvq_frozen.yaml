@@ -1,4 +1,4 @@
-run_name: global_rvq_norm_g64_l1_k128_lambda0035
+run_name: pilot_global_rvq_frozen_g64_l1_k128_lambda0035
 seed: 1234
 output_dir: experiments
 model:
@@ -17,7 +17,7 @@ stage_gate:
   enabled: false
 loss:
   lambda_rd: 0.0035
-  beta_commit: 0.1
+  beta_commit: 0.01
   rho_gate: 0.0
 data:
   train_roots:
@@ -25,22 +25,30 @@ data:
   patch_size: 256
   batch_size: 8
   num_workers: 4
-  max_train_images: null
+  max_train_images: 4096
 eval:
   root: /dpl/kodak
   num_workers: 2
 train:
-  epochs: 50
-  lr: 0.0001
+  epochs: 10
+  lr: 5.0e-05
   aux_lr: 0.001
-  log_interval: 50
+  log_interval: 20
   clip_max_norm: 1.0
-  lr_milestones:
-  - 46
+  lr_milestones: []
   lr_gamma: 0.1
-  save_interval_steps: 5000
+  save_interval_steps: 250
+  max_steps: 500
+  init_model: experiments/init/pilot_global_rvq_g64_l1_k128_from_scalar.pth.tar
+  freeze_prefixes:
+  - g_a
+  - h_a
+  - h_s
+  - entropy_bottleneck
+  - global_mu
+  - global_log_s
 wandb:
   enabled: true
   project: HCG-RVQ
-  name: global_rvq_norm_g64_l1_k128_lambda0035
+  name: pilot_global_rvq_frozen_g64_l1_k128_lambda0035
   mode: online

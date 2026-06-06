@@ -1,0 +1,51 @@
+name: e152_lowrate_hcs_hcg_signaled_branch
+description: >
+  State-preserving low-rate branch between matched HCS and active HCG bias010
+  checkpoints. The branch rule is the E144/E151 transfer-trained geometry
+  reliability rule: use HCG when image-level householder strength is low.
+
+data:
+  root: /dpl/openimages/open-images-v6/train/data
+  start_index: 4096
+  max_images: 4096
+  patch_size:
+
+branch:
+  base_method: hcs
+  candidate_method: hcg_bias010
+  feature: hcg_bias010_rvq_householder_strength
+  direction: low
+  threshold: 0.27135278284549713
+  include_one_bit_signal: true
+
+runs:
+  - seed: "1234"
+    method: hcs
+    step: 500
+    config: configs/pilot_hcs_rvq_frozen_lambda0018_seed1234.yaml
+    checkpoint: experiments/pilot_hcs_rvq_frozen_g64_l1_k128_lambda0018_seed1234/checkpoint_step_500.pth.tar
+  - seed: "1234"
+    method: hcg_bias010
+    step: 250
+    config: configs/pilot_hcg_rvq_h_gate025_bias010_frozen_lambda0018_seed1234.yaml
+    checkpoint: experiments/pilot_hcg_rvq_h_gate025_bias010_frozen_g64_l1_k128_lambda0018_seed1234/checkpoint_step_250.pth.tar
+  - seed: "2345"
+    method: hcs
+    step: 250
+    config: configs/pilot_hcs_rvq_frozen_lambda0018_seed2345.yaml
+    checkpoint: experiments/pilot_hcs_rvq_frozen_g64_l1_k128_lambda0018_seed2345/checkpoint_step_250.pth.tar
+  - seed: "2345"
+    method: hcg_bias010
+    step: 250
+    config: configs/pilot_hcg_rvq_h_gate025_bias010_frozen_lambda0018_seed2345.yaml
+    checkpoint: experiments/pilot_hcg_rvq_h_gate025_bias010_frozen_g64_l1_k128_lambda0018_seed2345/checkpoint_step_250.pth.tar
+  - seed: "3456"
+    method: hcs
+    step: 500
+    config: configs/pilot_hcs_rvq_frozen_lambda0018_seed3456.yaml
+    checkpoint: experiments/pilot_hcs_rvq_frozen_g64_l1_k128_lambda0018_seed3456/checkpoint_step_500.pth.tar
+  - seed: "3456"
+    method: hcg_bias010
+    step: 500
+    config: configs/pilot_hcg_rvq_h_gate025_bias010_frozen_lambda0018_seed3456.yaml
+    checkpoint: experiments/pilot_hcg_rvq_h_gate025_bias010_frozen_g64_l1_k128_lambda0018_seed3456/checkpoint_step_500.pth.tar
