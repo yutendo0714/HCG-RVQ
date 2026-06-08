@@ -34,9 +34,11 @@ sys.path.insert(0, str(GLC_DIR))
 from src.models.image_model import GLC_Image  # noqa: E402
 from src.utils.test_utils import from_minus1_1_to_0_1, get_state_dict  # noqa: E402
 from hcg_rvq.reliability_index_controller import (  # noqa: E402
+    QAwareThresholdControllerSpec,
     ReliabilityIndexMLP,
     ReliabilityIndexMLPConfig,
     mix_with_fallback,
+    qaware_threshold_gate,
 )
 from tools.run_e162_glc_pretrained_baseline import psnr01  # noqa: E402
 from tools.run_e175_glc_decoder_aware_tail_vq_train import (  # noqa: E402
@@ -96,9 +98,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-train-vectors", type=int, default=12000)
     p.add_argument("--max-rate-vectors", type=int, default=2048)
     p.add_argument("--steps", type=int, default=8)
+    p.add_argument("--checkpoint-every", type=int, default=0, help="Save HCG/RVQ branch checkpoints every N training steps; 0 disables checkpointing.")
     p.add_argument("--lr-codebook", type=float, default=2e-3)
     p.add_argument("--lr-controller", type=float, default=1e-3)
-    p.add_argument("--mse-weight", type=float, default=0.2)
+    p.add_argument("--mse-weight", type=float, default=0.0)
     p.add_argument("--lpips-weight", type=float, default=0.0)
     p.add_argument("--dists-weight", type=float, default=1.0)
     p.add_argument("--soft-index-weight", type=float, default=0.01)
@@ -109,11 +112,92 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--active-threshold", type=float, default=0.5)
     p.add_argument("--max-gate", type=float, default=1.0)
     p.add_argument("--rate-cap-dbpp", type=float, default=-1.0, help="If non-negative, emit rate-cap policy rows that pay full branch bpp for selected soft/all-on outputs.")
+    p.add_argument("--emit-progressive-extra-rows", action="store_true", help="Emit rows for a base-plus-active-RVQ progressive enhancement rate model.")
+    p.add_argument("--progressive-extra-cap-bpp", type=float, default=-1.0, help="If non-negative, cap progressive enhancement rows by active RVQ extra bpp.")
+    p.add_argument("--emit-replacement-rows", action="store_true", help="Emit rows for an active-scalar-to-active-RVQ replacement rate model.")
+    p.add_argument("--replacement-cap-dbpp", type=float, default=-1.0, help="If non-negative, cap replacement rows by active RVQ minus active scalar bpp.")
+    p.add_argument("--replacement-cap-dbpp-values", type=float, nargs="*", default=[], help="Additional replacement delta-bpp caps to emit with suffixed labels, e.g. 0.0025 0.0035 0.0040.")
+    p.add_argument("--replacement-signal-bits", type=float, nargs="*", default=[], help="Optional image-level selection/mode signal costs to add to capped replacement rows, e.g. 1 8.")
+    p.add_argument("--qaware-controller-json", type=Path, default=None, help="Optional E379-style q-aware deployment JSON. Emits replacement rows selected by the exported controller spec.")
+    p.add_argument("--qaware-policy-modes", nargs="*", default=["q-aware", "global"], help="Policy modes to load from --qaware-controller-json. Use an empty list to load all modes.")
     p.add_argument("--controller-hidden", type=int, default=16)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--lpips-net", default="alex", choices=["alex", "vgg", "squeeze"])
+    p.add_argument("--wandb-enabled", action="store_true", help="Log training trace and final perceptual summary rows to Weights & Biases.")
+    p.add_argument("--wandb-project", default="HCG-RVQ")
+    p.add_argument("--wandb-entity", default=None)
+    p.add_argument("--wandb-name", default=None)
+    p.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"])
     return p.parse_args()
+
+
+def maybe_init_wandb(args: argparse.Namespace):
+    if not args.wandb_enabled:
+        return None
+    import wandb
+
+    run_name = args.wandb_name or args.output_prefix.name
+    config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    return wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=run_name,
+        mode=args.wandb_mode,
+        config=config,
+        dir=str(args.output_prefix.parent),
+    )
+
+
+def wandb_log_summary(wandb_run: Any, summary: list[dict[str, Any]]) -> None:
+    if wandb_run is None:
+        return
+    for row in summary:
+        label = safe_token(str(row["label"]))
+        payload = {
+            f"final/{label}/bpp": row["bpp"],
+            f"final/{label}/delta_bpp": row["delta_bpp"],
+            f"final/{label}/ms_ssim": row["ms_ssim"],
+            f"final/{label}/delta_ms_ssim": row["delta_ms_ssim"],
+            f"final/{label}/lpips": row["lpips"],
+            f"final/{label}/delta_lpips": row["delta_lpips"],
+            f"final/{label}/dists": row["dists"],
+            f"final/{label}/delta_dists": row["delta_dists"],
+            f"final/{label}/score": row["score"],
+            f"final/{label}/selected_frac": row["selected_frac"],
+            f"final/{label}/gate_mean": row["gate_mean"],
+            f"final/{label}/index_entropy_mean": row["index_entropy_mean"],
+            f"final/{label}/nonfinite_rows": row["nonfinite_rows"],
+        }
+        wandb_run.log(payload)
+
+
+def save_branch_checkpoint(
+    args: argparse.Namespace,
+    step: int,
+    controller: torch.nn.Module,
+    codebooks_by_q: dict[int, list[torch.Tensor]],
+    feature_mu: torch.Tensor,
+    feature_std: torch.Tensor,
+    trace: list[dict[str, float]],
+) -> Path:
+    ckpt_path = args.output_prefix.parent / f"{args.output_prefix.name}_step{step:04d}.pt"
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "step": int(step),
+        "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+        "controller_state_dict": controller.state_dict(),
+        "codebooks_by_q": {
+            int(q): [cb.detach().cpu() for cb in codebooks]
+            for q, codebooks in codebooks_by_q.items()
+        },
+        "feature_mu": feature_mu.detach().cpu(),
+        "feature_std": feature_std.detach().cpu(),
+        "trace": trace,
+    }
+    torch.save(payload, ckpt_path)
+    print(f"[checkpoint] saved {ckpt_path}")
+    return ckpt_path
 
 
 def finite(value: Any, default: float = 0.0) -> float:
@@ -135,6 +219,66 @@ def mean_psnr(values: list[float]) -> float:
     return -10.0 * math.log10(mse) if mse > 0 else float("inf")
 
 
+def cap_token(value: float) -> str:
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return text.replace("-", "m").replace(".", "p")
+
+
+def image_signal_bpp(bits: float, item) -> float:
+    pixels = max(1.0, float(item.height * item.width))
+    return max(0.0, float(bits)) / pixels
+
+
+def safe_token(text: str) -> str:
+    out = []
+    for char in str(text):
+        if char.isalnum():
+            out.append(char.lower())
+        elif char == ".":
+            out.append("p")
+        else:
+            out.append("_")
+    return "_".join(part for part in "".join(out).split("_") if part)
+
+
+def load_qaware_specs(path: Path | None, policy_modes: list[str]) -> list[dict[str, Any]]:
+    if path is None:
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    policies = payload.get("policies")
+    if policies is None:
+        policies = [payload.get("main_policy")] if payload.get("main_policy") else []
+    allowed = {str(mode) for mode in policy_modes}
+    specs: list[dict[str, Any]] = []
+    for policy in policies:
+        if not isinstance(policy, dict):
+            continue
+        mode = str(policy.get("mode", "policy"))
+        if allowed and mode not in allowed:
+            continue
+        feature = str(policy.get("feature", "index_entropy_mean"))
+        raw_spec = policy.get("controller_spec", {})
+        raw_thresholds = raw_spec.get("thresholds", policy.get("deployment_thresholds", policy.get("thresholds", {})))
+        if not isinstance(raw_thresholds, dict):
+            continue
+        thresholds = {int(q): float(value) for q, value in raw_thresholds.items()}
+        if not thresholds:
+            continue
+        direction = str(raw_spec.get("direction", policy.get("direction", ">=")))
+        soft_width = float(raw_spec.get("soft_width", 0.0))
+        margin = policy.get("threshold_margin", "nomargin")
+        tag = safe_token(f"qaware_{mode}_{feature}_m{margin}")
+        specs.append(
+            {
+                "tag": tag,
+                "mode": mode,
+                "feature": feature,
+                "spec": QAwareThresholdControllerSpec(thresholds=thresholds, direction=direction, soft_width=soft_width),
+            }
+        )
+    return specs
+
+
 def branch_feature_dict(base_stats: dict[str, Any], branch_stats: dict[str, Any], pixels: float) -> dict[str, float]:
     base_bpp = finite(base_stats.get("gaussian_bits_total")) / pixels
     fixed_bpp = (finite(branch_stats.get("hybrid_fixed_bits_y")) + finite(branch_stats.get("bits_z"))) / pixels
@@ -149,6 +293,12 @@ def branch_feature_dict(base_stats: dict[str, Any], branch_stats: dict[str, Any]
         "empirical_bpp_delta": empirical_bpp - base_bpp,
         "fixed_bpp_delta": fixed_bpp - base_bpp,
         "base_bpp": base_bpp,
+        "inactive_scalar_bpp": finite(branch_stats.get("inactive_scalar_bits")) / pixels,
+        "active_scalar_bpp": finite(branch_stats.get("active_scalar_bits")) / pixels,
+        "active_rvq_fixed_bpp": finite(branch_stats.get("active_rvq_fixed_bits")) / pixels,
+        "active_rvq_empirical_bpp": finite(branch_stats.get("active_rvq_empirical_bits")) / pixels,
+        "active_rvq_extra_bpp": finite(branch_stats.get("active_rvq_empirical_bits")) / pixels,
+        "active_replacement_delta_bpp": (finite(branch_stats.get("active_rvq_empirical_bits")) - finite(branch_stats.get("active_scalar_bits"))) / pixels,
     }
 
 
@@ -212,6 +362,7 @@ def add_policy_row(
     base_bpp: float,
     feature_row: dict[str, float],
     nonfinite: int,
+    selection_signal_bpp: float = 0.0,
 ) -> None:
     rows.append(
         {
@@ -222,6 +373,7 @@ def add_policy_row(
             "width": item.width,
             "bpp": bpp,
             "base_bpp": base_bpp,
+            "selection_signal_bpp": selection_signal_bpp,
             "delta_bpp": bpp - base_bpp,
             "psnr": metrics["psnr"],
             "delta_psnr": metrics["psnr"] - base_metrics["psnr"],
@@ -240,6 +392,12 @@ def add_policy_row(
             "index_entropy_mean": feature_row["index_entropy_mean"],
             "index_used_frac_mean": feature_row["index_used_frac_mean"],
             "index_dead_frac_mean": feature_row["index_dead_frac_mean"],
+            "inactive_scalar_bpp": feature_row.get("inactive_scalar_bpp", 0.0),
+            "active_scalar_bpp": feature_row.get("active_scalar_bpp", 0.0),
+            "active_rvq_fixed_bpp": feature_row.get("active_rvq_fixed_bpp", 0.0),
+            "active_rvq_empirical_bpp": feature_row.get("active_rvq_empirical_bpp", 0.0),
+            "active_rvq_extra_bpp": feature_row.get("active_rvq_extra_bpp", 0.0),
+            "active_replacement_delta_bpp": feature_row.get("active_replacement_delta_bpp", 0.0),
             "nonfinite": nonfinite,
         }
     )
@@ -261,6 +419,7 @@ def evaluate_policies(
     label_prefix: str,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    qaware_specs = load_qaware_specs(args.qaware_controller_json, args.qaware_policy_modes)
     for q in q_indexes:
         for item in prepared:
             pixels = float(item.height * item.width)
@@ -400,6 +559,221 @@ def evaluate_policies(
                     feature_row=feature_row,
                     nonfinite=nonfinite,
                 )
+            if args.emit_progressive_extra_rows:
+                progressive_extra_bpp = max(0.0, feature_row.get("active_rvq_extra_bpp", 0.0))
+                add_policy_row(
+                    rows,
+                    label=f"{label_prefix}_progressive_extra_soft",
+                    q=q,
+                    item=item,
+                    bpp=base_bpp + progressive_extra_bpp,
+                    gate=soft_gate_mean,
+                    selected=soft_gate_mean > 0.0,
+                    metrics=soft_metrics,
+                    base_metrics=base_metrics,
+                    base_bpp=base_bpp,
+                    feature_row=feature_row,
+                    nonfinite=nonfinite,
+                )
+                add_policy_row(
+                    rows,
+                    label=f"{label_prefix}_progressive_extra_all_on",
+                    q=q,
+                    item=item,
+                    bpp=base_bpp + progressive_extra_bpp,
+                    gate=1.0,
+                    selected=True,
+                    metrics=branch_metrics,
+                    base_metrics=base_metrics,
+                    base_bpp=base_bpp,
+                    feature_row=feature_row,
+                    nonfinite=nonfinite,
+                )
+                if args.progressive_extra_cap_bpp >= 0.0:
+                    progressive_selected = progressive_extra_bpp <= args.progressive_extra_cap_bpp
+                    add_policy_row(
+                        rows,
+                        label=f"{label_prefix}_rate_cap_progressive_extra_soft",
+                        q=q,
+                        item=item,
+                        bpp=base_bpp + progressive_extra_bpp if progressive_selected else base_bpp,
+                        gate=soft_gate_mean if progressive_selected else 0.0,
+                        selected=progressive_selected,
+                        metrics=soft_metrics if progressive_selected else base_metrics,
+                        base_metrics=base_metrics,
+                        base_bpp=base_bpp,
+                        feature_row=feature_row,
+                        nonfinite=nonfinite,
+                    )
+                    add_policy_row(
+                        rows,
+                        label=f"{label_prefix}_rate_cap_progressive_extra_all_on",
+                        q=q,
+                        item=item,
+                        bpp=base_bpp + progressive_extra_bpp if progressive_selected else base_bpp,
+                        gate=1.0 if progressive_selected else 0.0,
+                        selected=progressive_selected,
+                        metrics=branch_metrics if progressive_selected else base_metrics,
+                        base_metrics=base_metrics,
+                        base_bpp=base_bpp,
+                        feature_row=feature_row,
+                        nonfinite=nonfinite,
+                    )
+            if args.emit_replacement_rows:
+                replacement_dbpp = feature_row.get("active_replacement_delta_bpp", 0.0)
+                replacement_bpp = base_bpp + replacement_dbpp
+                add_policy_row(
+                    rows,
+                    label=f"{label_prefix}_replacement_soft",
+                    q=q,
+                    item=item,
+                    bpp=replacement_bpp,
+                    gate=soft_gate_mean,
+                    selected=soft_gate_mean > 0.0,
+                    metrics=soft_metrics,
+                    base_metrics=base_metrics,
+                    base_bpp=base_bpp,
+                    feature_row=feature_row,
+                    nonfinite=nonfinite,
+                )
+                add_policy_row(
+                    rows,
+                    label=f"{label_prefix}_replacement_all_on",
+                    q=q,
+                    item=item,
+                    bpp=replacement_bpp,
+                    gate=1.0,
+                    selected=True,
+                    metrics=branch_metrics,
+                    base_metrics=base_metrics,
+                    base_bpp=base_bpp,
+                    feature_row=feature_row,
+                    nonfinite=nonfinite,
+                )
+                replacement_cap_specs: list[tuple[str, float]] = []
+                if args.replacement_cap_dbpp >= 0.0:
+                    replacement_cap_specs.append(("", args.replacement_cap_dbpp))
+                seen_replacement_caps = {round(cap, 12) for _, cap in replacement_cap_specs}
+                for cap in args.replacement_cap_dbpp_values:
+                    if cap < 0.0:
+                        continue
+                    rounded = round(float(cap), 12)
+                    if rounded in seen_replacement_caps:
+                        continue
+                    seen_replacement_caps.add(rounded)
+                    replacement_cap_specs.append((f"_cap{cap_token(float(cap))}", float(cap)))
+                for cap_suffix, cap_value in replacement_cap_specs:
+                    replacement_selected = replacement_dbpp <= cap_value
+                    add_policy_row(
+                        rows,
+                        label=f"{label_prefix}_rate_cap_replacement_soft{cap_suffix}",
+                        q=q,
+                        item=item,
+                        bpp=replacement_bpp if replacement_selected else base_bpp,
+                        gate=soft_gate_mean if replacement_selected else 0.0,
+                        selected=replacement_selected,
+                        metrics=soft_metrics if replacement_selected else base_metrics,
+                        base_metrics=base_metrics,
+                        base_bpp=base_bpp,
+                        feature_row=feature_row,
+                        nonfinite=nonfinite,
+                    )
+                    add_policy_row(
+                        rows,
+                        label=f"{label_prefix}_rate_cap_replacement_all_on{cap_suffix}",
+                        q=q,
+                        item=item,
+                        bpp=replacement_bpp if replacement_selected else base_bpp,
+                        gate=1.0 if replacement_selected else 0.0,
+                        selected=replacement_selected,
+                        metrics=branch_metrics if replacement_selected else base_metrics,
+                        base_metrics=base_metrics,
+                        base_bpp=base_bpp,
+                        feature_row=feature_row,
+                        nonfinite=nonfinite,
+                    )
+                    for signal_bits in args.replacement_signal_bits:
+                        if signal_bits < 0.0:
+                            continue
+                        signal_bpp = image_signal_bpp(signal_bits, item)
+                        signal_suffix = f"_sig{cap_token(float(signal_bits))}b"
+                        add_policy_row(
+                            rows,
+                            label=f"{label_prefix}_rate_cap_replacement_soft{cap_suffix}{signal_suffix}",
+                            q=q,
+                            item=item,
+                            bpp=(replacement_bpp if replacement_selected else base_bpp) + signal_bpp,
+                            gate=soft_gate_mean if replacement_selected else 0.0,
+                            selected=replacement_selected,
+                            metrics=soft_metrics if replacement_selected else base_metrics,
+                            base_metrics=base_metrics,
+                            base_bpp=base_bpp,
+                            feature_row=feature_row,
+                            nonfinite=nonfinite,
+                            selection_signal_bpp=signal_bpp,
+                        )
+                        add_policy_row(
+                            rows,
+                            label=f"{label_prefix}_rate_cap_replacement_all_on{cap_suffix}{signal_suffix}",
+                            q=q,
+                            item=item,
+                            bpp=(replacement_bpp if replacement_selected else base_bpp) + signal_bpp,
+                            gate=1.0 if replacement_selected else 0.0,
+                            selected=replacement_selected,
+                            metrics=branch_metrics if replacement_selected else base_metrics,
+                            base_metrics=base_metrics,
+                            base_bpp=base_bpp,
+                            feature_row=feature_row,
+                            nonfinite=nonfinite,
+                            selection_signal_bpp=signal_bpp,
+                        )
+                for spec_row in qaware_specs:
+                    feature_name = str(spec_row["feature"])
+                    feature_value = finite(feature_row.get(feature_name), float("nan"))
+                    selected = False
+                    if math.isfinite(feature_value):
+                        gate_tensor = qaware_threshold_gate(
+                            torch.tensor([feature_value], dtype=torch.float32, device=base.device),
+                            int(q),
+                            spec_row["spec"],
+                            hard=True,
+                        )
+                        selected = bool(float(gate_tensor.item()) > 0.5)
+                    label = f"{label_prefix}_{spec_row['tag']}_replacement_soft"
+                    add_policy_row(
+                        rows,
+                        label=label,
+                        q=q,
+                        item=item,
+                        bpp=replacement_bpp if selected else base_bpp,
+                        gate=soft_gate_mean if selected else 0.0,
+                        selected=selected,
+                        metrics=soft_metrics if selected else base_metrics,
+                        base_metrics=base_metrics,
+                        base_bpp=base_bpp,
+                        feature_row=feature_row,
+                        nonfinite=nonfinite,
+                    )
+                    for signal_bits in args.replacement_signal_bits:
+                        if signal_bits < 0.0:
+                            continue
+                        signal_bpp = image_signal_bpp(signal_bits, item)
+                        signal_suffix = f"_sig{cap_token(float(signal_bits))}b"
+                        add_policy_row(
+                            rows,
+                            label=f"{label}{signal_suffix}",
+                            q=q,
+                            item=item,
+                            bpp=(replacement_bpp if selected else base_bpp) + signal_bpp,
+                            gate=soft_gate_mean if selected else 0.0,
+                            selected=selected,
+                            metrics=soft_metrics if selected else base_metrics,
+                            base_metrics=base_metrics,
+                            base_bpp=base_bpp,
+                            feature_row=feature_row,
+                            nonfinite=nonfinite,
+                            selection_signal_bpp=signal_bpp,
+                        )
     return rows
 
 
@@ -413,6 +787,7 @@ def summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "images": len(subset),
                 "bpp": mean([finite(row["bpp"], float("nan")) for row in subset]),
                 "delta_bpp": mean([finite(row["delta_bpp"], float("nan")) for row in subset]),
+                "selection_signal_bpp": mean([finite(row.get("selection_signal_bpp", 0.0), float("nan")) for row in subset]),
                 "psnr": mean_psnr([finite(row["psnr"], float("nan")) for row in subset]),
                 "delta_psnr": mean([finite(row["delta_psnr"], float("nan")) for row in subset]),
                 "ms_ssim": mean([finite(row["ms_ssim"], float("nan")) for row in subset]),
@@ -471,12 +846,13 @@ def write_outputs(
         f"Eval dir/start/limit/crop: `{args.eval_dir}` / `{args.eval_start_index}` / `{args.eval_limit}` / `{args.eval_crop_size}`",
         f"Loss weights: mse `{args.mse_weight}`, lpips `{args.lpips_weight}`, dists `{args.dists_weight}`, soft-index `{args.soft_index_weight}`, gate-rate `{args.gate_rate_weight}`, gate-l1 `{args.gate_l1_weight}`",
         "",
-        "| label | images | bpp | dbpp | score | dPSNR | dMS-SSIM | dLPIPS | dDISTS | gate | selected | active MSE ratio | H | nonfinite |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| label | images | bpp | dbpp | signal bpp | score | dPSNR | dMS-SSIM | dLPIPS | dDISTS | gate | selected | active MSE ratio | H | nonfinite |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in summary:
         lines.append(
             f"| {row['label']} | {row['images']} | {row['bpp']:.6f} | {row['delta_bpp']:+.6f} | "
+            f"{row['selection_signal_bpp']:.8f} | "
             f"{row['score']:+.6f} | {row['delta_psnr']:+.6f} | {row['delta_ms_ssim']:+.6f} | "
             f"{row['delta_lpips']:+.6f} | {row['delta_dists']:+.6f} | {row['gate_mean']:.6f} | "
             f"{row['selected_frac']:.6f} | {row['active_mse_ratio']:.6f} | {row['index_entropy_mean']:.6f} | {row['nonfinite_rows']} |"
@@ -503,6 +879,7 @@ def write_outputs(
 
 def main() -> None:
     args = parse_args()
+    wandb_run = maybe_init_wandb(args)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = torch.device(args.device)
@@ -660,6 +1037,11 @@ def main() -> None:
             f"step={step}/{args.steps} loss={trace_row['loss']:.6f} image={trace_row['image_loss']:.6f} "
             f"rate={trace_row['rate_loss']:.6f} gate={trace_row['gate_mean']:.4f} dists={trace_row['dists']:.6f}"
         )
+        if wandb_run is not None:
+            train_payload = {f"train/{key}": value for key, value in trace_row.items() if key != "step"}
+            wandb_run.log(train_payload, step=step)
+        if args.checkpoint_every > 0 and (step % args.checkpoint_every == 0 or step == args.steps):
+            save_branch_checkpoint(args, step, controller, codebooks_by_q, feature_mu, feature_std, trace)
     net.forward_four_part_prior = official_forward
     print(f"training_ms={(time.perf_counter() - t0) * 1000.0:.1f}")
 
@@ -681,6 +1063,9 @@ def main() -> None:
     )
     summary = summarize(rows)
     write_outputs(args, train_paths, eval_paths, rows, summary, trace, feature_mu, feature_std)
+    wandb_log_summary(wandb_run, summary)
+    if wandb_run is not None:
+        wandb_run.finish()
     del train_prepared, eval_prepared, train_items_by_q, codebooks_by_q, controller, net
     gc.collect()
     if device.type == "cuda":
