@@ -12,4 +12,4 @@ third_party/
 *.pth
 *.pth.tar
 *.pt
-
+prompt.txt
