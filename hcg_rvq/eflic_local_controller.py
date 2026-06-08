@@ -18,6 +18,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from hcg_rvq.reliability_index_controller import (
+    SpatialReliabilityIndexConfig,
+    SpatialReliabilityIndexHead,
+    controller_gate,
+)
+
 FAMILY_NAMES: tuple[str, ...] = (
     "zero",
     "constant",
@@ -37,6 +43,26 @@ class LocalHCGHeadConfig:
     hidden_channels: int = 48
     num_families: int = len(FAMILY_NAMES)
     zero_bias: float = 2.0
+
+
+@dataclass(frozen=True)
+class EFLICHCGBranchControllerConfig:
+    """Conservative EF-LIC HCG branch-controller defaults.
+
+    The controller is designed to be inserted immediately after EF-LIC computes
+    `mean, scale = _mean_scale(support_buf, slice_id)`. It only consumes
+    decoder-available context maps and therefore does not add hidden side
+    information. Newly inserted heads are biased toward fallback.
+    """
+
+    input_channels: int = 11
+    hidden_channels: int = 32
+    max_alpha: float = 0.02
+    zero_bias: float = -6.0
+    risk_bias: float = 0.0
+    strength_bias: float = -4.0
+    support_ratio_channel: int = 5
+    prev_ratio_channel: int = 7
 
 
 def _reduce_rms(x: torch.Tensor) -> torch.Tensor:
@@ -153,6 +179,100 @@ class LocalHCGActivationHead(nn.Module):
 
     def forward(self, context_maps: torch.Tensor) -> torch.Tensor:
         return self.net(context_maps)
+
+
+class EFLICHCGBranchController(nn.Module):
+    """Decoder-safe spatial fallback controller for EF-LIC HCG geometry.
+
+    The module consumes `build_local_context_maps(...)` outputs. It returns an
+    alpha map that can be passed to the projected-HCG EF-LIC RVQ path. The
+    `force_zero` path is intentionally exact: it returns an all-zero alpha map
+    and therefore recovers the original EF-LIC quantizer path.
+    """
+
+    def __init__(self, config: EFLICHCGBranchControllerConfig | None = None):
+        super().__init__()
+        self.config = config or EFLICHCGBranchControllerConfig()
+        rel_cfg = SpatialReliabilityIndexConfig(
+            input_channels=self.config.input_channels,
+            hidden_channels=self.config.hidden_channels,
+            zero_bias=self.config.zero_bias,
+            risk_bias=self.config.risk_bias,
+        )
+        self.reliability = SpatialReliabilityIndexHead(rel_cfg)
+        self.family_head = LocalHCGFamilyHead(
+            LocalHCGHeadConfig(
+                input_channels=self.config.input_channels,
+                hidden_channels=self.config.hidden_channels,
+                num_families=len(FAMILY_NAMES),
+                zero_bias=2.0,
+            )
+        )
+        self.strength_head = nn.Sequential(
+            nn.Conv2d(self.config.input_channels, self.config.hidden_channels, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(self.config.hidden_channels, 1, kernel_size=1),
+        )
+        self.reset_strength_parameters()
+
+    def reset_strength_parameters(self) -> None:
+        for module in self.strength_head.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, nonlinearity="linear")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        last = self.strength_head[-1]
+        if isinstance(last, nn.Conv2d) and last.bias is not None:
+            nn.init.constant_(last.bias, float(self.config.strength_bias))
+
+    def _normalized_local_score(self, context_maps: torch.Tensor) -> torch.Tensor:
+        channels = context_maps.shape[1]
+        candidates = []
+        for idx in (self.config.support_ratio_channel, self.config.prev_ratio_channel):
+            if 0 <= idx < channels:
+                candidates.append(context_maps[:, idx : idx + 1].float().clamp_min(0.0))
+        if not candidates:
+            score = context_maps.new_ones((context_maps.shape[0], 1, context_maps.shape[2], context_maps.shape[3])).float()
+        else:
+            score = torch.stack(candidates, dim=0).amax(dim=0)
+        denom = score.flatten(1).mean(dim=1).view(score.shape[0], 1, 1, 1).clamp_min(1e-6)
+        return (score / (2.0 * denom)).clamp(0.0, 1.0).to(dtype=context_maps.dtype)
+
+    def forward(
+        self,
+        context_maps: torch.Tensor,
+        *,
+        hard: bool = False,
+        force_zero: bool = False,
+        active_threshold: float = 0.5,
+        max_risk: float = 0.0,
+        risk_temperature: float = 1.0,
+    ) -> dict[str, torch.Tensor]:
+        reliability = self.reliability(context_maps)
+        family_logits = self.family_head(context_maps)
+        if force_zero:
+            gate = torch.zeros_like(reliability["active_logit"])
+        else:
+            gate = controller_gate(
+                reliability["active_logit"],
+                risk_score=reliability["risk_score"],
+                active_threshold=active_threshold,
+                max_risk=max_risk,
+                risk_temperature=risk_temperature,
+                hard=hard,
+            )
+        strength = torch.sigmoid(self.strength_head(context_maps)) * float(self.config.max_alpha)
+        local_score = self._normalized_local_score(context_maps)
+        alpha_map = gate.to(dtype=context_maps.dtype) * strength.to(dtype=context_maps.dtype) * local_score
+        return {
+            "alpha_map": alpha_map,
+            "gate": gate,
+            "strength": strength,
+            "local_score": local_score,
+            "active_logit": reliability["active_logit"],
+            "risk_score": reliability["risk_score"],
+            "family_logits": family_logits,
+        }
 
 
 def binary_activation_loss(

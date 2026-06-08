@@ -100,6 +100,90 @@ class SpatialReliabilityIndexHead(nn.Module):
         return {"active_logit": out[:, :1], "risk_score": out[:, 1:2]}
 
 
+@dataclass(frozen=True)
+class QAwareThresholdControllerSpec:
+    """Decoder-reproducible q-aware fallback thresholds.
+
+    E371-E376 show that selected HCG-RVQ branches are useful only in reliable
+    local states.  This spec captures the simplest paper-facing controller:
+    a branch is active only when a decoder-side feature passes the threshold for
+    the current q-index.  Outside that set, the codec exactly falls back to the
+    original path.
+    """
+
+    thresholds: dict[int, float]
+    direction: str = ">="
+    soft_width: float = 0.0
+
+    def with_margin(self, margin: float) -> "QAwareThresholdControllerSpec":
+        """Return a stricter threshold spec for paper-safe activation."""
+
+        margin = float(margin)
+        if margin <= 0.0:
+            return self
+        if self.direction == ">=":
+            thresholds = {int(q): float(threshold) + margin for q, threshold in self.thresholds.items()}
+        elif self.direction == "<=":
+            thresholds = {int(q): float(threshold) - margin for q, threshold in self.thresholds.items()}
+        else:
+            raise ValueError(f"unsupported q-aware threshold direction {self.direction!r}")
+        return QAwareThresholdControllerSpec(
+            thresholds=thresholds,
+            direction=self.direction,
+            soft_width=self.soft_width,
+        )
+
+
+def qaware_threshold_gate(
+    feature_value: torch.Tensor,
+    q_index: torch.Tensor | int,
+    spec: QAwareThresholdControllerSpec,
+    *,
+    hard: bool = True,
+) -> torch.Tensor:
+    """Return a branch gate from q-index-specific feature thresholds.
+
+    `feature_value` can be an image-level vector or a spatial map.  `q_index`
+    can be a scalar integer/tensor or a tensor broadcastable to `feature_value`.
+    Hard mode returns exact 0/1 gates for deterministic bit accounting; soft mode
+    uses a narrow sigmoid around the threshold for calibration/fine-tuning.
+    """
+
+    if spec.direction not in {">=", "<="}:
+        raise ValueError(f"unsupported q-aware threshold direction {spec.direction!r}")
+    if not spec.thresholds:
+        return torch.zeros_like(feature_value)
+
+    if isinstance(q_index, int):
+        q_tensor = torch.full_like(feature_value, int(q_index), dtype=torch.long)
+    elif torch.is_tensor(q_index):
+        q_tensor = q_index.to(device=feature_value.device, dtype=torch.long)
+        while q_tensor.ndim < feature_value.ndim:
+            q_tensor = q_tensor.unsqueeze(-1)
+    else:
+        raise TypeError(f"q_index must be int or tensor, got {type(q_index)!r}")
+
+    if hard:
+        gate = torch.zeros_like(feature_value, dtype=torch.bool)
+        for q, threshold in spec.thresholds.items():
+            if spec.direction == ">=":
+                active = feature_value >= float(threshold)
+            else:
+                active = feature_value <= float(threshold)
+            gate = gate | ((q_tensor == int(q)) & active)
+        return gate.to(dtype=feature_value.dtype)
+
+    width = max(float(spec.soft_width), 1e-6)
+    gate = torch.zeros_like(feature_value)
+    for q, threshold in spec.thresholds.items():
+        signed = feature_value - float(threshold)
+        if spec.direction == "<=":
+            signed = -signed
+        local_gate = torch.sigmoid(signed / width)
+        gate = torch.where(q_tensor == int(q), local_gate, gate)
+    return gate.clamp(0.0, 1.0)
+
+
 def reliability_index_loss(
     active_logit: torch.Tensor,
     target_active: torch.Tensor,
