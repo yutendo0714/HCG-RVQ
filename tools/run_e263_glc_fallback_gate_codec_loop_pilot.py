@@ -32,7 +32,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(GLC_DIR))
 
 from src.models.image_model import GLC_Image  # noqa: E402
-from src.utils.test_utils import from_minus1_1_to_0_1, get_state_dict  # noqa: E402
+from src.models.loss import CodeLevelLoss, calculate_vqgan_results  # noqa: E402
+from src.utils.test_utils import from_minus1_1_to_0_1, get_state_dict, init_func  # noqa: E402
 from hcg_rvq.reliability_index_controller import (  # noqa: E402
     QAwareThresholdControllerSpec,
     ReliabilityIndexMLP,
@@ -42,6 +43,7 @@ from hcg_rvq.reliability_index_controller import (  # noqa: E402
 )
 from tools.run_e162_glc_pretrained_baseline import psnr01  # noqa: E402
 from tools.run_e175_glc_decoder_aware_tail_vq_train import (  # noqa: E402
+    PreparedImage,
     TrainableRVQCodebooks,
     build_initial_codebooks,
     crop_to_image,
@@ -98,12 +100,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-train-vectors", type=int, default=12000)
     p.add_argument("--max-rate-vectors", type=int, default=2048)
     p.add_argument("--steps", type=int, default=8)
+    p.add_argument(
+        "--train-batch-per-step",
+        type=int,
+        default=0,
+        help="If positive, sample this many prepared training images per step instead of using the full prepared set.",
+    )
     p.add_argument("--checkpoint-every", type=int, default=0, help="Save HCG/RVQ branch checkpoints every N training steps; 0 disables checkpointing.")
     p.add_argument("--lr-codebook", type=float, default=2e-3)
     p.add_argument("--lr-controller", type=float, default=1e-3)
     p.add_argument("--mse-weight", type=float, default=0.0)
+    p.add_argument("--l1-weight", type=float, default=0.0)
     p.add_argument("--lpips-weight", type=float, default=0.0)
     p.add_argument("--dists-weight", type=float, default=1.0)
+    p.add_argument("--branch-image-weight", type=float, default=0.0, help="Extra image loss on the deployable all-on branch, independent of the soft fallback mix.")
+    p.add_argument("--glc-feature-weight", type=float, default=0.0, help="GLC-style VQGAN latent feature MSE weight for the HCG branch latent.")
+    p.add_argument("--glc-code-weight", type=float, default=0.0, help="GLC-style VQGAN code prediction CE weight for the HCG branch latent.")
     p.add_argument("--soft-index-weight", type=float, default=0.01)
     p.add_argument("--soft-index-target", type=float, default=2.0)
     p.add_argument("--soft-index-temp", type=float, default=0.05)
@@ -129,6 +141,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb-entity", default=None)
     p.add_argument("--wandb-name", default=None)
     p.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"])
+    p.add_argument("--cache-images-on-cpu", action="store_true", help="Keep prepared train/eval tensors on CPU and move each item to GPU only while it is used.")
+    p.add_argument("--skip-init-eval", action="store_true", help="Skip the pre-training evaluation pass. This does not affect training updates.")
+    p.add_argument("--skip-final-eval", action="store_true", help="Skip the in-training final evaluation pass; use the export/eval script on saved checkpoints instead.")
     return p.parse_args()
 
 
@@ -176,9 +191,9 @@ def save_branch_checkpoint(
     args: argparse.Namespace,
     step: int,
     controller: torch.nn.Module,
-    codebooks_by_q: dict[int, list[torch.Tensor]],
-    feature_mu: torch.Tensor,
-    feature_std: torch.Tensor,
+    codebooks_by_q: dict[int, "TrainableRVQCodebooks"],
+    feature_mu: dict[str, float],
+    feature_std: dict[str, float],
     trace: list[dict[str, float]],
 ) -> Path:
     ckpt_path = args.output_prefix.parent / f"{args.output_prefix.name}_step{step:04d}.pt"
@@ -188,11 +203,11 @@ def save_branch_checkpoint(
         "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "controller_state_dict": controller.state_dict(),
         "codebooks_by_q": {
-            int(q): [cb.detach().cpu() for cb in codebooks]
+            int(q): codebooks.state_dict()
             for q, codebooks in codebooks_by_q.items()
         },
-        "feature_mu": feature_mu.detach().cpu(),
-        "feature_std": feature_std.detach().cpu(),
+        "feature_mu": feature_mu,
+        "feature_std": feature_std,
         "trace": trace,
     }
     torch.save(payload, ckpt_path)
@@ -316,6 +331,94 @@ def feature_tensor(row: dict[str, float], mu: dict[str, float], std: dict[str, f
     return torch.tensor([values], dtype=torch.float32, device=device)
 
 
+def prepared_to_device(item: PreparedImage, device: torch.device) -> PreparedImage:
+    if item.x_pad.device == device:
+        return item
+    return PreparedImage(
+        path=item.path,
+        img01=item.img01.to(device, non_blocking=True),
+        x=item.x.to(device, non_blocking=True),
+        x_pad=item.x_pad.to(device, non_blocking=True),
+        padding=item.padding,
+        height=item.height,
+        width=item.width,
+    )
+
+
+def run_instrumented_with_latent(net: GLC_Image, x_pad: torch.Tensor, q: int) -> tuple[torch.Tensor, dict[str, float], torch.Tensor]:
+    curr_q_enc = net.q_enc[q : q + 1]
+    curr_q_dec = net.q_dec[q : q + 1]
+    y_ori = net.vqgan.encoder(x_pad)
+    y = net.enc(y_ori, curr_q_enc)
+    z = net.hyper_enc(y)
+    with torch.no_grad():
+        index = net.z_vq.get_indices(z)
+        z_hat = net.z_vq.get_quan_feat(index, (z.shape[0], z.shape[2], z.shape[3], z.shape[1]))
+    params = net.hyper_dec(z_hat)
+    params = net.y_prior_fusion(params)
+    y_res, y_q, y_hat_prior, scales_hat = net.forward_four_part_prior(
+        y,
+        params,
+        net.y_spatial_prior_adaptor_1,
+        net.y_spatial_prior_adaptor_2,
+        net.y_spatial_prior_adaptor_3,
+        net.y_spatial_prior,
+        y_spatial_prior_reduction=net.y_spatial_prior_reduction,
+    )
+    y_hat_dec = net.dec(y_hat_prior, curr_q_dec)
+    x_hat = net.vqgan.generator(y_hat_dec)
+    bit_y = float(net.get_y_gaussian_bits(y_q.detach(), scales_hat.detach()).sum().item())
+    bit_z = float(z_hat.shape[-2] * z_hat.shape[-1] * math.log2(net.codebook_size))
+    stats = {
+        "gaussian_bits_y": bit_y,
+        "bits_z": bit_z,
+        "gaussian_bits_total": bit_y + bit_z,
+        "y_res_std": float(y_res.detach().float().std(unbiased=False).item()),
+        "y_q_std": float(y_q.detach().float().std(unbiased=False).item()),
+        "nonfinite_forward": int(
+            (not torch.isfinite(x_hat).all().item())
+            or (not torch.isfinite(y_res).all().item())
+            or (not torch.isfinite(y_q).all().item())
+            or (not torch.isfinite(scales_hat).all().item())
+            or (not torch.isfinite(y_hat_dec).all().item())
+        ),
+    }
+    stats.update(getattr(net, "_e175_tail_vq_stats", {}))
+    return x_hat, stats, y_hat_dec
+
+
+def glc_semantic_branch_loss(
+    net: GLC_Image,
+    code_level_loss: CodeLevelLoss,
+    branch_latent: torch.Tensor,
+    x_pad: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    feat_weight = float(args.glc_feature_weight)
+    code_weight = float(args.glc_code_weight)
+    if feat_weight == 0.0 and code_weight == 0.0:
+        zero = branch_latent.new_zeros(())
+        return zero, {"glc_feat": 0.0, "glc_code": 0.0}
+    latent_tokens = int(branch_latent.shape[2] * branch_latent.shape[3])
+    expected_tokens = int(net.code_pred_loss.position_emb.shape[0])
+    if latent_tokens != expected_tokens:
+        raise ValueError(
+            "GLC code-prediction loss expects train crops whose latent token count "
+            f"is {expected_tokens}, got {latent_tokens}. Use --train-crop-size 256 for this loss."
+        )
+    with torch.no_grad():
+        results_vqgan = calculate_vqgan_results(x_pad, net.vqgan)
+    logits = net.code_pred_loss(branch_latent)
+    semantic_parts = code_level_loss(branch_latent, logits, results_vqgan, repeat_num=1)
+    feat_loss = semantic_parts["feat_mse_loss"].mean()
+    code_loss = semantic_parts["cross_entropy_loss"].mean()
+    loss = feat_weight * feat_loss + code_weight * code_loss
+    return loss, {
+        "glc_feat": float(feat_loss.detach().item()),
+        "glc_code": float(code_loss.detach().item()),
+    }
+
+
 @torch.no_grad()
 def collect_initial_feature_rows(
     net: GLC_Image,
@@ -329,12 +432,16 @@ def collect_initial_feature_rows(
     for q in q_indexes:
         install_trainable_branch(net, codebooks_by_q[q], args)
         for item in prepared:
+            item = prepared_to_device(item, next(net.parameters()).device)
             pixels = float(item.height * item.width)
             net.forward_four_part_prior = official_forward
             _, base_stats = run_instrumented(net, item.x_pad, q)
             install_trainable_branch(net, codebooks_by_q[q], args)
             _, branch_stats = run_instrumented(net, item.x_pad, q)
             rows.append(branch_feature_dict(base_stats, branch_stats, pixels))
+            del item
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     net.forward_four_part_prior = official_forward
     return rows
 
@@ -422,6 +529,9 @@ def evaluate_policies(
     qaware_specs = load_qaware_specs(args.qaware_controller_json, args.qaware_policy_modes)
     for q in q_indexes:
         for item in prepared:
+            torch.cuda.empty_cache()
+            gc.collect()
+            item = prepared_to_device(item, next(net.parameters()).device)
             pixels = float(item.height * item.width)
             net.forward_four_part_prior = official_forward
             base_pad, base_stats = run_instrumented(net, item.x_pad, q)
@@ -774,6 +884,9 @@ def evaluate_policies(
                             nonfinite=nonfinite,
                             selection_signal_bpp=signal_bpp,
                         )
+            del item
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     return rows
 
 
@@ -844,7 +957,7 @@ def write_outputs(
         "",
         f"Train dir/start/limit/crop: `{args.train_dir}` / `{args.train_start_index}` / `{args.train_limit}` / `{args.train_crop_size}`",
         f"Eval dir/start/limit/crop: `{args.eval_dir}` / `{args.eval_start_index}` / `{args.eval_limit}` / `{args.eval_crop_size}`",
-        f"Loss weights: mse `{args.mse_weight}`, lpips `{args.lpips_weight}`, dists `{args.dists_weight}`, soft-index `{args.soft_index_weight}`, gate-rate `{args.gate_rate_weight}`, gate-l1 `{args.gate_l1_weight}`",
+        f"Loss weights: l1 `{args.l1_weight}`, mse `{args.mse_weight}`, lpips `{args.lpips_weight}`, dists `{args.dists_weight}`, branch-image `{args.branch_image_weight}`, glc-feature `{args.glc_feature_weight}`, glc-code `{args.glc_code_weight}`, soft-index `{args.soft_index_weight}`, gate-rate `{args.gate_rate_weight}`, gate-l1 `{args.gate_l1_weight}`",
         "",
         "| label | images | bpp | dbpp | signal bpp | score | dPSNR | dMS-SSIM | dLPIPS | dDISTS | gate | selected | active MSE ratio | H | nonfinite |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -863,13 +976,15 @@ def write_outputs(
                 "",
                 "## Train Trace",
                 "",
-                "| step | loss | image | rate | gate l1 | soft H | soft excess | gate | dists |",
-                "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+                "| step | loss | image | branch image | glc feat | glc code | rate | gate l1 | soft H | soft excess | gate | dists |",
+                "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         for row in trace:
             lines.append(
-                f"| {row['step']} | {row['loss']:.6f} | {row['image_loss']:.6f} | {row['rate_loss']:.6f} | "
+                f"| {row['step']} | {row['loss']:.6f} | {row['image_loss']:.6f} | "
+                f"{row.get('branch_image_loss', 0.0):.6f} | {row.get('glc_feat_loss', 0.0):.6f} | "
+                f"{row.get('glc_code_loss', 0.0):.6f} | {row['rate_loss']:.6f} | "
                 f"{row['gate_l1_loss']:.6f} | {row['soft_index_entropy']:.6f} | {row['soft_index_excess']:.6f} | "
                 f"{row['gate_mean']:.6f} | {row['dists']:.6f} |"
             )
@@ -878,6 +993,7 @@ def write_outputs(
 
 
 def main() -> None:
+    init_func()
     args = parse_args()
     wandb_run = maybe_init_wandb(args)
     torch.manual_seed(args.seed)
@@ -904,20 +1020,27 @@ def main() -> None:
     net.load_state_dict(get_state_dict(str(args.ckpt_path)), strict=True)
     for p in net.parameters():
         p.requires_grad_(False)
+    code_level_loss = CodeLevelLoss(net.vqgan).to(device).eval()
+    for p in code_level_loss.parameters():
+        p.requires_grad_(False)
     official_forward = net.forward_four_part_prior
     active_parts = set(args.active_parts)
     active_groups = set(args.active_groups)
 
-    train_prepared = prepare_images(train_paths, device, args.padding_size, args.train_crop_size)
-    eval_prepared = prepare_images(eval_paths, device, args.padding_size, args.eval_crop_size)
+    cache_device = torch.device("cpu") if args.cache_images_on_cpu else device
+    train_prepared = prepare_images(train_paths, cache_device, args.padding_size, args.train_crop_size)
+    eval_prepared = prepare_images(eval_paths, cache_device, args.padding_size, args.eval_crop_size)
     train_items_by_q = {}
     codebooks_by_q: dict[int, TrainableRVQCodebooks] = {}
     with torch.no_grad():
         for q in args.q_indexes:
-            train_items = [
-                collect_residual_set_from_prepared(net, item, q, args.group_size, active_parts, active_groups)
-                for item in train_prepared
-            ]
+            train_items = []
+            for item in train_prepared:
+                item_gpu = prepared_to_device(item, device)
+                train_items.append(collect_residual_set_from_prepared(net, item_gpu, q, args.group_size, active_parts, active_groups))
+                del item_gpu
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
             train_items_by_q[q] = train_items
             initial = build_initial_codebooks(
                 train_items,
@@ -939,20 +1062,22 @@ def main() -> None:
         ReliabilityIndexMLPConfig(input_dim=len(FEATURES), hidden_dim=args.controller_hidden, zero_bias=-2.0)
     ).to(device)
 
-    rows = evaluate_policies(
-        net,
-        official_forward,
-        controller,
-        codebooks_by_q,
-        eval_prepared,
-        args.q_indexes,
-        args,
-        lpips_fn,
-        dists_fn,
-        feature_mu,
-        feature_std,
-        "init",
-    )
+    rows = []
+    if not args.skip_init_eval:
+        rows = evaluate_policies(
+            net,
+            official_forward,
+            controller,
+            codebooks_by_q,
+            eval_prepared,
+            args.q_indexes,
+            args,
+            lpips_fn,
+            dists_fn,
+            feature_mu,
+            feature_std,
+            "init",
+        )
 
     params = [
         {"params": [p for module in codebooks_by_q.values() for p in module.parameters()], "lr": args.lr_codebook},
@@ -960,18 +1085,29 @@ def main() -> None:
     ]
     opt = torch.optim.Adam(params)
     trace: list[dict[str, Any]] = []
-    num_train_losses = max(1, len(args.q_indexes) * len(train_prepared))
     t0 = time.perf_counter()
     for step in range(1, args.steps + 1):
+        if args.train_batch_per_step > 0 and args.train_batch_per_step < len(train_prepared):
+            step_rng = np.random.default_rng(args.seed + step * 1009)
+            step_indices = step_rng.choice(len(train_prepared), size=args.train_batch_per_step, replace=False)
+            step_prepared = [train_prepared[int(idx)] for idx in step_indices]
+        else:
+            step_prepared = train_prepared
+        num_train_losses = max(1, len(args.q_indexes) * len(step_prepared))
         opt.zero_grad(set_to_none=True)
         accum = {
             "loss": 0.0,
             "image_loss": 0.0,
             "rate_loss": 0.0,
             "gate_l1_loss": 0.0,
+            "branch_image_loss": 0.0,
+            "glc_feat_loss": 0.0,
+            "glc_code_loss": 0.0,
+            "semantic_loss": 0.0,
             "soft_index_entropy": 0.0,
             "soft_index_excess": 0.0,
             "gate_mean": 0.0,
+            "l1": 0.0,
             "mse": 0.0,
             "lpips": 0.0,
             "dists": 0.0,
@@ -979,14 +1115,15 @@ def main() -> None:
         count = 0
         for q in args.q_indexes:
             install_trainable_branch(net, codebooks_by_q[q], args)
-            for item in train_prepared:
+            for item in step_prepared:
+                item = prepared_to_device(item, device)
                 pixels = float(item.height * item.width)
                 with torch.no_grad():
                     net.forward_four_part_prior = official_forward
                     base_pad, base_stats = run_instrumented(net, item.x_pad, q)
                     base = crop_to_image(base_pad, item).detach()
                 install_trainable_branch(net, codebooks_by_q[q], args)
-                branch_pad, branch_stats = run_instrumented(net, item.x_pad, q)
+                branch_pad, branch_stats, branch_latent = run_instrumented_with_latent(net, item.x_pad, q)
                 branch = crop_to_image(branch_pad, item)
                 feat = branch_feature_dict(base_stats, branch_stats, pixels)
                 ctrl = controller(feature_tensor(feat, feature_mu, feature_std, device))
@@ -1000,6 +1137,14 @@ def main() -> None:
                 )
                 mixed01 = from_minus1_1_to_0_1(mixed).clamp(0, 1)
                 img_loss, parts = image_loss(mixed, mixed01, item, lpips_fn, dists_fn, args)
+                branch_image_loss = mixed.new_zeros(())
+                branch_parts = None
+                if float(args.branch_image_weight) != 0.0:
+                    branch01 = from_minus1_1_to_0_1(branch).clamp(0, 1)
+                    branch_image_loss, branch_parts = image_loss(branch, branch01, item, lpips_fn, dists_fn, args)
+                    img_loss = img_loss + float(args.branch_image_weight) * branch_image_loss
+                semantic_loss, semantic_parts = glc_semantic_branch_loss(net, code_level_loss, branch_latent, item.x_pad, args)
+                img_loss = img_loss + semantic_loss
                 gate_mean = gate.mean()
                 rate_delta = max(0.0, feat["empirical_bpp_delta"])
                 rate_loss = gate_mean * mixed.new_tensor(rate_delta * float(args.gate_rate_weight))
@@ -1008,13 +1153,20 @@ def main() -> None:
                 loss.backward()
                 accum["loss"] += float(loss.detach().item())
                 accum["image_loss"] += float(img_loss.detach().item())
+                accum["branch_image_loss"] += float(branch_image_loss.detach().item())
+                accum["semantic_loss"] += float(semantic_loss.detach().item())
+                accum["glc_feat_loss"] += semantic_parts["glc_feat"]
+                accum["glc_code_loss"] += semantic_parts["glc_code"]
                 accum["rate_loss"] += float(rate_loss.detach().item())
                 accum["gate_l1_loss"] += float(gate_l1_loss.detach().item())
                 accum["gate_mean"] += float(gate_mean.detach().item())
-                for key in ("mse", "lpips", "dists"):
+                for key in ("l1", "mse", "lpips", "dists"):
                     accum[key] += parts[key]
+                    if branch_parts is not None:
+                        accum[key] += float(args.branch_image_weight) * branch_parts[key]
                 count += 1
-                del base_pad, base, branch_pad, branch, mixed, mixed01, img_loss, rate_loss, gate_l1_loss, loss
+                del base_pad, base, branch_pad, branch, branch_latent, mixed, mixed01, img_loss, branch_image_loss, semantic_loss, rate_loss, gate_l1_loss, loss
+                del item
             proxy, proxy_parts = soft_usage_entropy(codebooks_by_q[q], train_items_by_q[q], args, q, device)
             soft_loss = args.soft_index_weight * proxy / max(1, len(args.q_indexes))
             soft_loss.backward()
@@ -1035,7 +1187,9 @@ def main() -> None:
         trace.append(trace_row)
         print(
             f"step={step}/{args.steps} loss={trace_row['loss']:.6f} image={trace_row['image_loss']:.6f} "
-            f"rate={trace_row['rate_loss']:.6f} gate={trace_row['gate_mean']:.4f} dists={trace_row['dists']:.6f}"
+            f"branch={trace_row['branch_image_loss']:.6f} glc_feat={trace_row['glc_feat_loss']:.6f} "
+            f"glc_code={trace_row['glc_code_loss']:.6f} rate={trace_row['rate_loss']:.6f} "
+            f"gate={trace_row['gate_mean']:.4f} dists={trace_row['dists']:.6f}"
         )
         if wandb_run is not None:
             train_payload = {f"train/{key}": value for key, value in trace_row.items() if key != "step"}
@@ -1045,22 +1199,23 @@ def main() -> None:
     net.forward_four_part_prior = official_forward
     print(f"training_ms={(time.perf_counter() - t0) * 1000.0:.1f}")
 
-    rows.extend(
-        evaluate_policies(
-            net,
-            official_forward,
-            controller,
-            codebooks_by_q,
-            eval_prepared,
-            args.q_indexes,
-            args,
-            lpips_fn,
-            dists_fn,
-            feature_mu,
-            feature_std,
-            "trained",
+    if not args.skip_final_eval:
+        rows.extend(
+            evaluate_policies(
+                net,
+                official_forward,
+                controller,
+                codebooks_by_q,
+                eval_prepared,
+                args.q_indexes,
+                args,
+                lpips_fn,
+                dists_fn,
+                feature_mu,
+                feature_std,
+                "trained",
+            )
         )
-    )
     summary = summarize(rows)
     write_outputs(args, train_paths, eval_paths, rows, summary, trace, feature_mu, feature_std)
     wandb_log_summary(wandb_run, summary)

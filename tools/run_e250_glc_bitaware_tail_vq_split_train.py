@@ -70,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=8)
     p.add_argument("--lr", type=float, default=2e-3)
     p.add_argument("--mse-weight", type=float, default=0.2)
+    p.add_argument("--l1-weight", type=float, default=0.0)
     p.add_argument("--lpips-weight", type=float, default=0.0)
     p.add_argument("--dists-weight", type=float, default=1.0)
     p.add_argument("--soft-index-weight", type=float, default=0.01)
@@ -130,10 +131,13 @@ def image_loss(
     args: argparse.Namespace,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     mse = F.mse_loss(branch01, target.img01)
+    l1 = F.l1_loss(branch01, target.img01)
     lpips_val = lpips_fn(branch, target.x).mean()
     dists_val = dists_call(dists_fn, branch01, target.img01, require_grad=True)
-    loss = args.mse_weight * mse + args.lpips_weight * lpips_val + args.dists_weight * dists_val
+    l1_weight = float(getattr(args, "l1_weight", 0.0))
+    loss = l1_weight * l1 + args.mse_weight * mse + args.lpips_weight * lpips_val + args.dists_weight * dists_val
     return loss, {
+        "l1": float(l1.detach().item()),
         "mse": float(mse.detach().item()),
         "lpips": float(lpips_val.detach().item()),
         "dists": float(dists_val.detach().item()),
@@ -191,7 +195,7 @@ def write_outputs(
         "",
         f"Train dir/start/limit/crop: `{args.train_dir}` / `{args.train_start_index}` / `{args.train_limit}` / `{args.train_crop_size}`",
         f"Eval dir/start/limit/crop: `{args.eval_dir}` / `{args.eval_start_index}` / `{args.eval_limit}` / `{args.eval_crop_size}`",
-        f"Loss weights: mse `{args.mse_weight}`, lpips `{args.lpips_weight}`, dists `{args.dists_weight}`, soft-index `{args.soft_index_weight}` target `{args.soft_index_target}` temp `{args.soft_index_temp}`",
+        f"Loss weights: l1 `{args.l1_weight}`, mse `{args.mse_weight}`, lpips `{args.lpips_weight}`, dists `{args.dists_weight}`, soft-index `{args.soft_index_weight}` target `{args.soft_index_target}` temp `{args.soft_index_temp}`",
         "",
         "| label | q | images | base bpp | emp bpp | emp dbpp | PSNR base | PSNR branch | MS base | MS branch | LPIPS base | LPIPS branch | DISTS base | DISTS branch | active MSE ratio | H | nonfinite |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",

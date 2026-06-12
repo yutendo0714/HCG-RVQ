@@ -9773,3 +9773,129 @@ Artifacts:
 - experiments/analysis/e386_eflic_perceptual_feature_gate_split_clic20_21.{md,json}
 - experiments/analysis/e387_eflic_perceptual_feature_gate_split_clic21_20.{md,json}
 - experiments/analysis/e388_eflic_cross_dataset_feature_gate_kodak_clic.{md,json,summary.csv}
+
+## E390 VCIP-Critical GLC Paper-Training Decision
+
+Status: Planned/ready. After re-reading the local GLC paper notes and official
+GitHub clone, the VCIP-critical path is not scratch reproduction of all three
+GLC stages. The GLC paper trains Stage I VQGAN/VQ-VAE on ImageNet, then Stage
+II/III latent coding and joint fine-tuning on OpenImages with a perceptual/code
+objective. The public clone in `third_party/GLC` exposes pretrained evaluation
+code and checkpoints, but not the full training pipeline. Reimplementing Stage I
+through Stage III from scratch before the VCIP deadline would be high risk and
+would weaken reproducibility.
+
+Decision: promote GLC as a paper-facing plug-in fine-tuning run from the official
+pretrained `GLC_image.pth.tar`. The baseline and HCG-RVQ model share the same
+checkpoint, dataset split, q indexes, evaluation path, and perceptual objective;
+only the HCG-RVQ branch/reliability controller is trained. This is the strongest
+near-term claim: HCG-RVQ improves a strong pretrained VQ/generative LIC model by
+making the quantizer/replacement reliability q-aware, index-entropy-aware, and
+fallback-safe. Full scratch 3-stage GLC reproduction is an optional extension or
+appendix item after the plug-in claim is secured.
+
+Implementation update: `tools/run_e263_glc_fallback_gate_codec_loop_pilot.py`
+now supports `--train-batch-per-step`, preserving the old full-prepared-set
+behavior when it is zero. `scripts/run_glc_qaware_paper_branch_train.sh` is the
+recommended separate-machine run script for CLIC Professional/OpenImages
+paper-facing training. It uses DISTS/LPIPS/bpp only for the generative claim and
+keeps PSNR out of decisions.
+
+Recommended first full run: CLIC Professional eval, OpenImages train, q0-q3,
+4096 prepared train images, 16 sampled images per step, 3000 steps, 3 seeds,
+checkpoints every 250 steps, CUDA device 0 only. Promote to longer/partial
+end-to-end unfreeze only if checkpoints show finite outputs, negative perceptual
+score (`delta_DISTS + 3*delta_LPIPS + delta_bpp`), stable selected fraction, and
+no positive-tail failure under the q-aware replacement rows.
+
+Artifacts:
+
+- scripts/run_glc_qaware_paper_branch_train.sh
+- tools/run_e263_glc_fallback_gate_codec_loop_pilot.py (`--train-batch-per-step`)
+
+
+## E391 GLC Paper-Branch Mid-Checkpoint Triage
+
+Status: Promising but not paper-proof yet. The active run_glc_qaware_paper_branch_train.sh run differs from earlier longrun probes mainly because it uses the paper-facing sampled training loop with train-batch-per-step 16, OpenImages train / CLIC Professional eval, q0-q3, wandb logging, and a perceptual-only objective. The absolute train/loss magnitude is therefore not comparable to the previous full-prepared-set longrun: the old loop averaged over the full prepared train set each step, while this run averages over a much smaller sampled batch. Use image, dists, lpips, rate, gate, and checkpoint evaluation instead of raw train/loss magnitude.
+
+Local wandb output shows the intended gate-opening pattern rather than an immediate failure: step250 has image=0.197145, rate=0.000034, gate=0.1288, dists=0.144250; step750 has image=0.180608, rate=0.000173, gate=0.1707, dists=0.136404. The rising rate is expected when the branch starts using HCG/RVQ corrections, provided perceptual metrics and checkpoint policies improve.
+
+Checkpoint step750 was evaluated on a lightweight CLIC Professional 8-image crop256 diagnostic because full-resolution eval on the same GPU hit OOM while training was running. Results are encouraging: replacement_soft improves the paper-facing perceptual score by -0.022214 with delta_LPIPS=-0.005575, delta_DISTS=-0.003066, and delta_bpp=-0.002424; q-aware entropy/margin replacement improves by -0.008732 while selecting 28.1 percent of rows. The unsafe all_on rows still degrade with score=+0.048223, confirming that the reliability controller is essential.
+
+Decision: keep the current run alive and evaluate each saved checkpoint full-resolution on an idle GPU or separate machine. Promotion requires full-resolution CLIC results to preserve negative LPIPS/DISTS/bpp score, zero nonfinite rows, and no positive-tail failure under the q-aware replacement policy. Do not claim large paper-level gains from the crop diagnostic alone.
+
+Artifacts:
+
+- tools/eval_glc_qaware_branch_checkpoint.py
+- experiments/analysis/e391_glc_paper_branch_ckpt0750_clicpro8_crop256.{md,csv,json}
+
+## E392-E399 GLC Test250 and Deployability Gap Fill
+
+E392 exists as a standalone RD-claim triage artifact rather than a progress-log
+entry. It compared the completed HCG-GLC run against the digitized GLC paper
+curve, but warned that the local finished run used CLIC Professional 41 images,
+not the official CLIC test-250 protocol. The useful conclusion was directional:
+`replacement_soft` improved matched local bpp/DISTS/LPIPS, but paper-facing
+claims required official CLIC test-250 export/evaluation.
+
+E393 generated official CLIC test-250 exports for three seeds. E394 summarized
+those exports. On the relaxed `replacement_soft` output, pooled 3-seed x
+4-quality means improved bpp by 8.478%, FID by 6.832%, KID by about 18-20%,
+DISTS by 3.590%, LPIPS by 2.397%, and MS-SSIM by 1.023%. BD-rate-like bpp
+savings were about -18.1% for FID, -24% to -25% for KID, -15.2% for DISTS, and
+-12.3% for LPIPS. This is promising headroom, but it is not a deployable main
+claim because the soft mixture itself is not a bitstream-valid reconstruction.
+
+E395 generated the matching all-on ablation exports for three seeds. E396 audited
+deployable accounting and showed why the soft result cannot be used as the main
+paper claim: dense all-on replacement degrades badly on CLIC test250, with pooled
+FID -53.635%, KID -184.412%, DISTS -20.913%, and LPIPS -27.085% relative to the
+base. Therefore the method needs hard/q-aware reliability and exact fallback,
+not just a better average soft blend.
+
+E397/E398 do not currently have standalone summary artifacts in
+`experiments/analysis`; they were intermediate numbering during the export/audit
+iteration. E399 is a direct semantic-loss smoke run, confirming that adding
+GLC-style branch image loss plus latent/code losses is finite on GPU0 for one
+image/one step. E400 then repeats this through the paper training script and the
+new deployable export path.
+
+Artifacts:
+
+- experiments/analysis/e392_glc_hcg_qaware_rd_claim/summary.md
+- experiments/analysis/e393_glc_hcg_seed{1234,2345,3456}_clic_test250_export/
+- experiments/analysis/e394_glc_hcg_clic_test250_summary/summary.md
+- experiments/analysis/e395_glc_hcg_ablation_seed{1234,2345,3456}_clic_test250_export/
+- experiments/analysis/e396_glc_hcg_deployable_accounting_audit/summary.md
+- experiments/analysis/e399_glc_semantic_loss_smoke_clic_gpu0.md
+
+## E400 GLC Deployable Metric Path and GLC-Style Loss Smoke
+
+Status: implementation smoke passed on GPU0 only. GPU1 is excluded from all
+future runs because it produces NaNs on this machine. The GLC/HCG-RVQ critical
+path now separates paper-claimable deployable outputs from relaxed diagnostics:
+`replacement_soft` remains an upper-bound probe, but export defaults are
+`base` and hard/fallback rows. The official metric path writes PNGs for
+`hard_gate`, `replacement_hard`, and q-aware hard replacement rows with optional
+image-level signal bpp, then feeds those outputs to GLC's `evaluate_quality`.
+
+The training loop now has optional GLC-style branch regularization:
+deployable-branch image loss plus `CodeLevelLoss` feature/code losses on the
+HCG branch latent. A 1-step script smoke with q0-q3, `--cache-images-on-cpu`,
+`--skip-init-eval`, and `--skip-final-eval` completed on GPU0 with finite
+`glc_feat=0.070243` and `glc_code=3.272204`; checkpoint export on CLIC test
+also completed for hard/q-aware labels. This smoke is not a performance result.
+It confirms that the FID-failure mitigation path can be launched from
+`scripts/run_glc_qaware_paper_branch_train.sh` without relying on GPU1.
+
+Decision: next performance runs should use only deployable hard/q-aware labels
+for FID/KID/DISTS/LPIPS/bpp claims. `replacement_soft` may appear only as a
+diagnostic upper bound, not as the main R-D claim.
+
+Artifacts:
+
+- scripts/run_glc_qaware_paper_branch_train.sh
+- tools/run_e263_glc_fallback_gate_codec_loop_pilot.py
+- tools/export_glc_hcg_qaware_branch_recon.py
+- experiments/analysis/e400_script_semantic_loss_smoke_gpu0/
+- experiments/analysis/e400_script_semantic_loss_smoke_gpu0_export/
