@@ -96,6 +96,9 @@ def soft_usage_entropy(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     entropies: list[torch.Tensor] = []
     excesses: list[torch.Tensor] = []
+    floors: list[torch.Tensor] = []
+    floor_target = float(getattr(args, "soft_index_floor_target", 0.0))
+    floor_weight = float(getattr(args, "soft_index_floor_weight", 0.0))
     for key in codebooks.stage_counts:
         vectors = vectors_for_key(train_items, key, args.scope)
         vectors = sample_rows(vectors, args.max_rate_vectors, args.seed + q_index * 10000 + key)
@@ -110,15 +113,20 @@ def soft_usage_entropy(
             entropy = -(usage * usage.log2()).sum()
             entropies.append(entropy)
             excesses.append(F.relu(entropy - args.soft_index_target))
+            if floor_target > 0.0 and floor_weight > 0.0:
+                floors.append(F.relu(floor_target - entropy))
             residual = residual - probs.matmul(cb)
     if not entropies:
         zero = torch.zeros((), device=device)
-        return zero, {"soft_index_entropy": 0.0, "soft_index_excess": 0.0}
+        return zero, {"soft_index_entropy": 0.0, "soft_index_excess": 0.0, "soft_index_floor": 0.0}
     entropy_mean = torch.stack(entropies).mean()
     excess_mean = torch.stack(excesses).mean()
-    return excess_mean, {
+    floor_mean = torch.stack(floors).mean() if floors else torch.zeros((), device=device)
+    proxy = excess_mean + floor_weight * floor_mean
+    return proxy, {
         "soft_index_entropy": float(entropy_mean.detach().item()),
         "soft_index_excess": float(excess_mean.detach().item()),
+        "soft_index_floor": float(floor_mean.detach().item()),
     }
 
 

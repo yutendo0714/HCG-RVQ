@@ -66,12 +66,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--qaware-policy-modes", nargs="*", default=["q-aware", "global"])
     p.add_argument("--controller-hidden", type=int, default=None)
     p.add_argument("--lpips-net", default="alex", choices=["alex", "vgg", "squeeze"])
+    p.add_argument("--l1-weight", type=float, default=0.0)
     p.add_argument("--mse-weight", type=float, default=0.0)
     p.add_argument("--lpips-weight", type=float, default=0.30)
     p.add_argument("--dists-weight", type=float, default=1.0)
+    p.add_argument("--branch-image-weight", type=float, default=0.0)
+    p.add_argument("--glc-feature-weight", type=float, default=0.0)
+    p.add_argument("--glc-code-weight", type=float, default=0.0)
     p.add_argument("--soft-index-weight", type=float, default=0.005)
     p.add_argument("--gate-rate-weight", type=float, default=1.0)
     p.add_argument("--gate-l1-weight", type=float, default=0.01)
+    p.add_argument("--train-hard-gate-st", action="store_true")
+    p.add_argument("--context-from-scalar", action="store_true")
+    p.add_argument("--fixed-gate-values", type=float, nargs="*", default=[])
     p.add_argument("--train-dir", type=Path, default=Path("."))
     p.add_argument("--train-start-index", type=int, default=0)
     p.add_argument("--train-limit", type=int, default=0)
@@ -118,6 +125,8 @@ def main() -> None:
         args.q_indexes = [int(q) for q in payload["codebooks_by_q"].keys()]
     if args.controller_hidden is None:
         args.controller_hidden = int(ckpt_args.get("controller_hidden", 16))
+    if not args.context_from_scalar:
+        args.context_from_scalar = bool(ckpt_args.get("context_from_scalar", False))
 
     import DISTS_pytorch as dists
     import lpips

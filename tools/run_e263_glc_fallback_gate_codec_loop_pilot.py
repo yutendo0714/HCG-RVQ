@@ -24,6 +24,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from pytorch_msssim import ms_ssim
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +81,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train-dir", type=Path, default=Path("/dpl/openimages/open-images-v6/train/data"))
     p.add_argument("--eval-dir", type=Path, default=ROOT / "experiments" / "data" / "kodak24")
     p.add_argument("--ckpt-path", type=Path, default=GLC_DIR / "checkpoints" / "GLC_image.pth.tar")
+    p.add_argument("--init-branch-checkpoint", type=Path, default=None, help="Optional saved HCG branch checkpoint to fine-tune instead of k-means reinitialization.")
     p.add_argument("--output-prefix", type=Path, default=ROOT / "experiments" / "analysis" / "e263_glc_fallback_gate_codec_loop_pilot_smoke")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--q-indexes", type=int, nargs="*", default=[0])
@@ -114,13 +116,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lpips-weight", type=float, default=0.0)
     p.add_argument("--dists-weight", type=float, default=1.0)
     p.add_argument("--branch-image-weight", type=float, default=0.0, help="Extra image loss on the deployable all-on branch, independent of the soft fallback mix.")
+    p.add_argument("--teacher-soft-weight", type=float, default=0.0, help="Distill the trainable hard/deployable branch toward the frozen init checkpoint soft fallback output.")
+    p.add_argument("--teacher-l1-weight", type=float, default=0.0)
+    p.add_argument("--teacher-mse-weight", type=float, default=0.0)
+    p.add_argument("--teacher-lpips-weight", type=float, default=0.0)
+    p.add_argument("--teacher-dists-weight", type=float, default=1.0)
     p.add_argument("--glc-feature-weight", type=float, default=0.0, help="GLC-style VQGAN latent feature MSE weight for the HCG branch latent.")
     p.add_argument("--glc-code-weight", type=float, default=0.0, help="GLC-style VQGAN code prediction CE weight for the HCG branch latent.")
     p.add_argument("--soft-index-weight", type=float, default=0.01)
     p.add_argument("--soft-index-target", type=float, default=2.0)
+    p.add_argument("--soft-index-floor-target", type=float, default=0.0, help="If positive, penalize codebook soft-usage entropy below this target.")
+    p.add_argument("--soft-index-floor-weight", type=float, default=0.0, help="Relative weight for the low-entropy soft-usage floor inside the soft-index proxy.")
     p.add_argument("--soft-index-temp", type=float, default=0.05)
     p.add_argument("--gate-rate-weight", type=float, default=1.0)
     p.add_argument("--gate-l1-weight", type=float, default=0.02)
+    p.add_argument("--train-hard-gate-st", action="store_true", help="Train the fallback controller with a hard forward gate and straight-through sigmoid gradient.")
+    p.add_argument("--train-fixed-mix-gate", type=float, default=-1.0, help="If non-negative, train the image objective on base + gate * (branch - base) with this fixed scalar gate.")
+    p.add_argument("--train-fixed-mix-loss-scale", type=float, default=1.0, help="Optional multiplier for the mixed-image loss when --train-fixed-mix-gate is used; useful because branch gradients scale with the fixed gate.")
+    p.add_argument("--context-from-scalar", action="store_true", help="Use the original scalar quantized parts for autoregressive context while applying HCG-RVQ only to the final reconstructed latent.")
+    p.add_argument("--fixed-gate-values", type=float, nargs="*", default=[], help="Emit fixed-gain HCG enhancement rows. Honest enhancement bpp keeps base GLC and adds active RVQ empirical bits.")
     p.add_argument("--active-threshold", type=float, default=0.5)
     p.add_argument("--max-gate", type=float, default=1.0)
     p.add_argument("--rate-cap-dbpp", type=float, default=-1.0, help="If non-negative, emit rate-cap policy rows that pay full branch bpp for selected soft/all-on outputs.")
@@ -213,6 +227,37 @@ def save_branch_checkpoint(
     torch.save(payload, ckpt_path)
     print(f"[checkpoint] saved {ckpt_path}")
     return ckpt_path
+
+
+def key_from_param_name(name: str) -> tuple[int, int] | None:
+    if not name.startswith("params."):
+        return None
+    token = name.split(".", 1)[1]
+    key_token, stage_token = token.rsplit("_s", 1)
+    if key_token.startswith("m"):
+        key = -int(key_token[1:])
+    elif key_token.startswith("p"):
+        key = int(key_token[1:])
+    else:
+        return None
+    return key, int(stage_token)
+
+
+def codebooks_from_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    device: torch.device,
+) -> TrainableRVQCodebooks:
+    staged: dict[int, dict[int, torch.Tensor]] = {}
+    for name, tensor in state_dict.items():
+        parsed = key_from_param_name(str(name))
+        if parsed is None:
+            continue
+        key, stage = parsed
+        staged.setdefault(key, {})[stage] = tensor.detach().cpu()
+    initial = {key: [stages[i] for i in sorted(stages)] for key, stages in staged.items()}
+    module = TrainableRVQCodebooks(initial, device).to(device)
+    module.load_state_dict(state_dict, strict=True)
+    return module
 
 
 def finite(value: Any, default: float = 0.0) -> float:
@@ -385,6 +430,38 @@ def run_instrumented_with_latent(net: GLC_Image, x_pad: torch.Tensor, q: int) ->
     }
     stats.update(getattr(net, "_e175_tail_vq_stats", {}))
     return x_hat, stats, y_hat_dec
+
+
+def teacher_distill_loss(
+    pred: torch.Tensor,
+    pred01: torch.Tensor,
+    teacher: torch.Tensor,
+    teacher01: torch.Tensor,
+    lpips_fn,
+    dists_fn,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    weight = float(args.teacher_soft_weight)
+    if weight == 0.0:
+        zero = pred.new_zeros(())
+        return zero, {"teacher_l1": 0.0, "teacher_mse": 0.0, "teacher_lpips": 0.0, "teacher_dists": 0.0}
+    mse = F.mse_loss(pred01, teacher01)
+    l1 = F.l1_loss(pred01, teacher01)
+    lpips_val = lpips_fn(pred, teacher).mean()
+    dists_val = dists_call(dists_fn, pred01, teacher01, require_grad=True)
+    inner = (
+        float(args.teacher_l1_weight) * l1
+        + float(args.teacher_mse_weight) * mse
+        + float(args.teacher_lpips_weight) * lpips_val
+        + float(args.teacher_dists_weight) * dists_val
+    )
+    loss = weight * inner
+    return loss, {
+        "teacher_l1": float(l1.detach().item()),
+        "teacher_mse": float(mse.detach().item()),
+        "teacher_lpips": float(lpips_val.detach().item()),
+        "teacher_dists": float(dists_val.detach().item()),
+    }
 
 
 def glc_semantic_branch_loss(
@@ -634,6 +711,43 @@ def evaluate_policies(
                 feature_row=feature_row,
                 nonfinite=nonfinite,
             )
+            for fixed_gate in getattr(args, "fixed_gate_values", []):
+                fixed_gate = float(fixed_gate)
+                if fixed_gate < 0.0:
+                    continue
+                fixed_gate = min(float(args.max_gate), fixed_gate)
+                fixed_mixed = base + fixed_gate * (branch - base)
+                fixed01 = from_minus1_1_to_0_1(fixed_mixed).clamp(0, 1)
+                fixed_metrics = metric_values(fixed_mixed, fixed01, item, lpips_fn, dists_fn)
+                gate_suffix = cap_token(fixed_gate)
+                add_policy_row(
+                    rows,
+                    label=f"{label_prefix}_fixed_gate{gate_suffix}_honest_enhance",
+                    q=q,
+                    item=item,
+                    bpp=base_bpp + feature_row.get("active_rvq_empirical_bpp", 0.0),
+                    gate=fixed_gate,
+                    selected=fixed_gate > 0.0,
+                    metrics=fixed_metrics,
+                    base_metrics=base_metrics,
+                    base_bpp=base_bpp,
+                    feature_row=feature_row,
+                    nonfinite=nonfinite,
+                )
+                add_policy_row(
+                    rows,
+                    label=f"{label_prefix}_fixed_gate{gate_suffix}_replacement_probe",
+                    q=q,
+                    item=item,
+                    bpp=base_bpp + feature_row.get("active_replacement_delta_bpp", 0.0),
+                    gate=fixed_gate,
+                    selected=fixed_gate > 0.0,
+                    metrics=fixed_metrics,
+                    base_metrics=base_metrics,
+                    base_bpp=base_bpp,
+                    feature_row=feature_row,
+                    nonfinite=nonfinite,
+                )
             print(
                 f"{label_prefix} q={q} {item.path.name} all_on_score={rows[-3]['score']:+.6f} "
                 f"soft_score={rows[-2]['score']:+.6f} hard_score={rows[-1]['score']:+.6f} "
@@ -957,7 +1071,7 @@ def write_outputs(
         "",
         f"Train dir/start/limit/crop: `{args.train_dir}` / `{args.train_start_index}` / `{args.train_limit}` / `{args.train_crop_size}`",
         f"Eval dir/start/limit/crop: `{args.eval_dir}` / `{args.eval_start_index}` / `{args.eval_limit}` / `{args.eval_crop_size}`",
-        f"Loss weights: l1 `{args.l1_weight}`, mse `{args.mse_weight}`, lpips `{args.lpips_weight}`, dists `{args.dists_weight}`, branch-image `{args.branch_image_weight}`, glc-feature `{args.glc_feature_weight}`, glc-code `{args.glc_code_weight}`, soft-index `{args.soft_index_weight}`, gate-rate `{args.gate_rate_weight}`, gate-l1 `{args.gate_l1_weight}`",
+        f"Loss weights: l1 `{args.l1_weight}`, mse `{args.mse_weight}`, lpips `{args.lpips_weight}`, dists `{args.dists_weight}`, branch-image `{args.branch_image_weight}`, glc-feature `{args.glc_feature_weight}`, glc-code `{args.glc_code_weight}`, soft-index `{args.soft_index_weight}`, gate-rate `{args.gate_rate_weight}`, gate-l1 `{args.gate_l1_weight}`, train-hard-gate-st `{args.train_hard_gate_st}`",
         "",
         "| label | images | bpp | dbpp | signal bpp | score | dPSNR | dMS-SSIM | dLPIPS | dDISTS | gate | selected | active MSE ratio | H | nonfinite |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -976,14 +1090,14 @@ def write_outputs(
                 "",
                 "## Train Trace",
                 "",
-                "| step | loss | image | branch image | glc feat | glc code | rate | gate l1 | soft H | soft excess | gate | dists |",
-                "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+                "| step | loss | image | branch image | teacher | glc feat | glc code | rate | gate l1 | soft H | soft excess | gate | dists |",
+                "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         for row in trace:
             lines.append(
                 f"| {row['step']} | {row['loss']:.6f} | {row['image_loss']:.6f} | "
-                f"{row.get('branch_image_loss', 0.0):.6f} | {row.get('glc_feat_loss', 0.0):.6f} | "
+                f"{row.get('branch_image_loss', 0.0):.6f} | {row.get('teacher_loss', 0.0):.6f} | {row.get('glc_feat_loss', 0.0):.6f} | "
                 f"{row.get('glc_code_loss', 0.0):.6f} | {row['rate_loss']:.6f} | "
                 f"{row['gate_l1_loss']:.6f} | {row['soft_index_entropy']:.6f} | {row['soft_index_excess']:.6f} | "
                 f"{row['gate_mean']:.6f} | {row['dists']:.6f} |"
@@ -1029,7 +1143,20 @@ def main() -> None:
 
     cache_device = torch.device("cpu") if args.cache_images_on_cpu else device
     train_prepared = prepare_images(train_paths, cache_device, args.padding_size, args.train_crop_size)
-    eval_prepared = prepare_images(eval_paths, cache_device, args.padding_size, args.eval_crop_size)
+    needs_eval_prepared = not (args.skip_init_eval and args.skip_final_eval)
+    eval_prepared = (
+        prepare_images(eval_paths, cache_device, args.padding_size, args.eval_crop_size)
+        if needs_eval_prepared
+        else []
+    )
+    init_payload: dict[str, Any] | None = None
+    if args.init_branch_checkpoint is not None:
+        init_payload = torch.load(args.init_branch_checkpoint, map_location="cpu")
+        ckpt_hidden = init_payload.get("args", {}).get("controller_hidden")
+        if ckpt_hidden is not None:
+            args.controller_hidden = int(ckpt_hidden)
+        print(f"[init] fine-tuning HCG branch from {args.init_branch_checkpoint}")
+
     train_items_by_q = {}
     codebooks_by_q: dict[int, TrainableRVQCodebooks] = {}
     with torch.no_grad():
@@ -1042,25 +1169,58 @@ def main() -> None:
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
             train_items_by_q[q] = train_items
-            initial = build_initial_codebooks(
-                train_items,
-                args.scope,
-                args.k,
-                args.stages,
-                args.kmeans_iters,
-                args.max_train_vectors,
-                args.seed + q * 10000,
-                device,
-            )
-            codebooks_by_q[q] = TrainableRVQCodebooks(initial, device).to(device)
-            print(f"initialized q={q} keys={len(initial)} train_vectors={sum(int(x.vectors.shape[0]) for x in train_items)}")
+            if init_payload is None:
+                initial = build_initial_codebooks(
+                    train_items,
+                    args.scope,
+                    args.k,
+                    args.stages,
+                    args.kmeans_iters,
+                    args.max_train_vectors,
+                    args.seed + q * 10000,
+                    device,
+                )
+                codebooks_by_q[q] = TrainableRVQCodebooks(initial, device).to(device)
+                print(f"initialized q={q} keys={len(initial)} train_vectors={sum(int(x.vectors.shape[0]) for x in train_items)}")
+        if init_payload is not None:
+            raw_codebooks = {int(q): state for q, state in init_payload["codebooks_by_q"].items()}
+            for q in args.q_indexes:
+                if int(q) not in raw_codebooks:
+                    raise SystemExit(f"init branch checkpoint is missing q={q}")
+                codebooks_by_q[int(q)] = codebooks_from_state_dict(raw_codebooks[int(q)], device)
+                print(f"[init] loaded q={q} codebook keys={len(codebooks_by_q[int(q)].stage_counts)}")
     net.masks = {}
 
-    feature_rows = collect_initial_feature_rows(net, official_forward, codebooks_by_q, train_prepared, args.q_indexes, args)
-    feature_mu, feature_std = standardizer(feature_rows)
+    if init_payload is not None:
+        feature_mu = {str(k): float(v) for k, v in init_payload["feature_mu"].items()}
+        feature_std = {str(k): float(v) for k, v in init_payload["feature_std"].items()}
+    else:
+        feature_rows = collect_initial_feature_rows(net, official_forward, codebooks_by_q, train_prepared, args.q_indexes, args)
+        feature_mu, feature_std = standardizer(feature_rows)
     controller = ReliabilityIndexMLP(
         ReliabilityIndexMLPConfig(input_dim=len(FEATURES), hidden_dim=args.controller_hidden, zero_bias=-2.0)
     ).to(device)
+    if init_payload is not None:
+        controller.load_state_dict(init_payload["controller_state_dict"], strict=True)
+
+    teacher_codebooks_by_q: dict[int, TrainableRVQCodebooks] = {}
+    teacher_controller: ReliabilityIndexMLP | None = None
+    if float(args.teacher_soft_weight) != 0.0:
+        if init_payload is None:
+            raise SystemExit("--teacher-soft-weight requires --init-branch-checkpoint")
+        teacher_controller = ReliabilityIndexMLP(
+            ReliabilityIndexMLPConfig(input_dim=len(FEATURES), hidden_dim=args.controller_hidden, zero_bias=-2.0)
+        ).to(device).eval()
+        teacher_controller.load_state_dict(init_payload["controller_state_dict"], strict=True)
+        for param in teacher_controller.parameters():
+            param.requires_grad_(False)
+        raw_teacher_codebooks = {int(q): state for q, state in init_payload["codebooks_by_q"].items()}
+        for q in args.q_indexes:
+            teacher_module = codebooks_from_state_dict(raw_teacher_codebooks[int(q)], device).eval()
+            for param in teacher_module.parameters():
+                param.requires_grad_(False)
+            teacher_codebooks_by_q[int(q)] = teacher_module
+        print(f"[teacher] frozen init soft output enabled with weight={args.teacher_soft_weight}")
 
     rows = []
     if not args.skip_init_eval:
@@ -1101,11 +1261,17 @@ def main() -> None:
             "rate_loss": 0.0,
             "gate_l1_loss": 0.0,
             "branch_image_loss": 0.0,
+            "teacher_loss": 0.0,
+            "teacher_l1": 0.0,
+            "teacher_mse": 0.0,
+            "teacher_lpips": 0.0,
+            "teacher_dists": 0.0,
             "glc_feat_loss": 0.0,
             "glc_code_loss": 0.0,
             "semantic_loss": 0.0,
             "soft_index_entropy": 0.0,
             "soft_index_excess": 0.0,
+            "soft_index_floor": 0.0,
             "gate_mean": 0.0,
             "l1": 0.0,
             "mse": 0.0,
@@ -1122,27 +1288,70 @@ def main() -> None:
                     net.forward_four_part_prior = official_forward
                     base_pad, base_stats = run_instrumented(net, item.x_pad, q)
                     base = crop_to_image(base_pad, item).detach()
+                    teacher = None
+                    teacher01 = None
+                    if teacher_controller is not None:
+                        install_trainable_branch(net, teacher_codebooks_by_q[q], args)
+                        teacher_branch_pad, teacher_stats = run_instrumented(net, item.x_pad, q)
+                        teacher_branch = crop_to_image(teacher_branch_pad, item).detach()
+                        teacher_feat = branch_feature_dict(base_stats, teacher_stats, pixels)
+                        teacher_ctrl = teacher_controller(feature_tensor(teacher_feat, feature_mu, feature_std, device))
+                        teacher_mixed, _ = mix_with_fallback(
+                            base,
+                            teacher_branch,
+                            teacher_ctrl["active_logit"],
+                            active_threshold=args.active_threshold,
+                            hard=False,
+                            max_gate=args.max_gate,
+                        )
+                        teacher = teacher_mixed.detach()
+                        teacher01 = from_minus1_1_to_0_1(teacher).clamp(0, 1).detach()
+                        del teacher_branch_pad, teacher_branch, teacher_mixed
                 install_trainable_branch(net, codebooks_by_q[q], args)
                 branch_pad, branch_stats, branch_latent = run_instrumented_with_latent(net, item.x_pad, q)
                 branch = crop_to_image(branch_pad, item)
                 feat = branch_feature_dict(base_stats, branch_stats, pixels)
                 ctrl = controller(feature_tensor(feat, feature_mu, feature_std, device))
-                mixed, gate = mix_with_fallback(
-                    base,
-                    branch,
-                    ctrl["active_logit"],
-                    active_threshold=args.active_threshold,
-                    hard=False,
-                    max_gate=args.max_gate,
-                )
+                if float(args.train_fixed_mix_gate) >= 0.0:
+                    gate_value = max(0.0, min(float(args.max_gate), float(args.train_fixed_mix_gate)))
+                    gate = torch.tensor(gate_value, device=base.device, dtype=base.dtype)
+                    while gate.ndim < base.ndim:
+                        gate = gate.unsqueeze(-1)
+                    mixed = base + gate * (branch - base)
+                elif bool(args.train_hard_gate_st):
+                    gate_soft = torch.sigmoid(ctrl["active_logit"]).clamp(0.0, float(args.max_gate))
+                    gate_hard = (gate_soft >= float(args.active_threshold)).to(dtype=gate_soft.dtype)
+                    gate = gate_hard.detach() - gate_soft.detach() + gate_soft
+                    while gate.ndim < base.ndim:
+                        gate = gate.unsqueeze(-1)
+                    gate = gate.to(device=base.device, dtype=base.dtype)
+                    mixed = base + gate * (branch - base)
+                else:
+                    mixed, gate = mix_with_fallback(
+                        base,
+                        branch,
+                        ctrl["active_logit"],
+                        active_threshold=args.active_threshold,
+                        hard=False,
+                        max_gate=args.max_gate,
+                    )
                 mixed01 = from_minus1_1_to_0_1(mixed).clamp(0, 1)
                 img_loss, parts = image_loss(mixed, mixed01, item, lpips_fn, dists_fn, args)
+                if float(args.train_fixed_mix_gate) >= 0.0:
+                    img_loss = img_loss * float(args.train_fixed_mix_loss_scale)
                 branch_image_loss = mixed.new_zeros(())
+                teacher_loss = mixed.new_zeros(())
                 branch_parts = None
-                if float(args.branch_image_weight) != 0.0:
+                teacher_parts = {"teacher_l1": 0.0, "teacher_mse": 0.0, "teacher_lpips": 0.0, "teacher_dists": 0.0}
+                branch01 = None
+                if float(args.branch_image_weight) != 0.0 or teacher is not None:
                     branch01 = from_minus1_1_to_0_1(branch).clamp(0, 1)
+                if float(args.branch_image_weight) != 0.0:
                     branch_image_loss, branch_parts = image_loss(branch, branch01, item, lpips_fn, dists_fn, args)
                     img_loss = img_loss + float(args.branch_image_weight) * branch_image_loss
+                if teacher is not None and teacher01 is not None:
+                    teacher_loss, teacher_parts = teacher_distill_loss(branch, branch01, teacher, teacher01, lpips_fn, dists_fn, args)
+                    img_loss = img_loss + teacher_loss
                 semantic_loss, semantic_parts = glc_semantic_branch_loss(net, code_level_loss, branch_latent, item.x_pad, args)
                 img_loss = img_loss + semantic_loss
                 gate_mean = gate.mean()
@@ -1154,6 +1363,9 @@ def main() -> None:
                 accum["loss"] += float(loss.detach().item())
                 accum["image_loss"] += float(img_loss.detach().item())
                 accum["branch_image_loss"] += float(branch_image_loss.detach().item())
+                accum["teacher_loss"] += float(teacher_loss.detach().item())
+                for teacher_key, teacher_value in teacher_parts.items():
+                    accum[teacher_key] += teacher_value
                 accum["semantic_loss"] += float(semantic_loss.detach().item())
                 accum["glc_feat_loss"] += semantic_parts["glc_feat"]
                 accum["glc_code_loss"] += semantic_parts["glc_code"]
@@ -1165,7 +1377,7 @@ def main() -> None:
                     if branch_parts is not None:
                         accum[key] += float(args.branch_image_weight) * branch_parts[key]
                 count += 1
-                del base_pad, base, branch_pad, branch, branch_latent, mixed, mixed01, img_loss, branch_image_loss, semantic_loss, rate_loss, gate_l1_loss, loss
+                del base_pad, base, branch_pad, branch, branch_latent, mixed, mixed01, teacher, teacher01, img_loss, branch_image_loss, teacher_loss, semantic_loss, rate_loss, gate_l1_loss, loss
                 del item
             proxy, proxy_parts = soft_usage_entropy(codebooks_by_q[q], train_items_by_q[q], args, q, device)
             soft_loss = args.soft_index_weight * proxy / max(1, len(args.q_indexes))
@@ -1173,6 +1385,7 @@ def main() -> None:
             accum["loss"] += float(soft_loss.detach().item())
             accum["soft_index_entropy"] += proxy_parts["soft_index_entropy"]
             accum["soft_index_excess"] += proxy_parts["soft_index_excess"]
+            accum["soft_index_floor"] += proxy_parts.get("soft_index_floor", 0.0)
             del proxy, soft_loss
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_([p for group in params for p in group["params"]], args.grad_clip)
@@ -1182,12 +1395,12 @@ def main() -> None:
             torch.cuda.empty_cache()
         trace_row = {"step": step}
         for key, value in accum.items():
-            denom = max(1, count) if key not in {"soft_index_entropy", "soft_index_excess"} else max(1, len(args.q_indexes))
+            denom = max(1, count) if key not in {"soft_index_entropy", "soft_index_excess", "soft_index_floor"} else max(1, len(args.q_indexes))
             trace_row[key] = value / denom
         trace.append(trace_row)
         print(
             f"step={step}/{args.steps} loss={trace_row['loss']:.6f} image={trace_row['image_loss']:.6f} "
-            f"branch={trace_row['branch_image_loss']:.6f} glc_feat={trace_row['glc_feat_loss']:.6f} "
+            f"branch={trace_row['branch_image_loss']:.6f} teacher={trace_row['teacher_loss']:.6f} glc_feat={trace_row['glc_feat_loss']:.6f} "
             f"glc_code={trace_row['glc_code_loss']:.6f} rate={trace_row['rate_loss']:.6f} "
             f"gate={trace_row['gate_mean']:.4f} dists={trace_row['dists']:.6f}"
         )

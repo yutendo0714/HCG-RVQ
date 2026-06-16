@@ -296,13 +296,16 @@ def trainable_tail_forward_four_part_prior(
             stats,
         )
         y_hat_part = y_q + means_hat
+        scalar_y_hat_part = scalar_y_q + means_hat
         stats["inactive_scalar_bits"] = stats.get("inactive_scalar_bits", 0.0) + sum_float(inactive_bits)
         stats["original_scalar_bits"] = stats.get("original_scalar_bits", 0.0) + sum_float(scalar_bits)
         y_res_parts.append(y_res)
         y_q_parts.append(y_q)
         y_hat_parts.append(y_hat_part)
         s_hat_parts.append(scales_hat)
-        y_hat_so_far = y_hat_part if y_hat_so_far is None else y_hat_so_far + y_hat_part
+        context_from_scalar = bool(getattr(self, "_e175_context_from_scalar", False))
+        context_part = scalar_y_hat_part if context_from_scalar else y_hat_part
+        y_hat_so_far = context_part if y_hat_so_far is None else y_hat_so_far + context_part
     y_res_all = sum(y_res_parts)
     y_q_all = sum(y_q_parts)
     y_hat = sum(y_hat_parts) * q_dec
@@ -333,6 +336,7 @@ def install_trainable_branch(
     net._e175_active_parts = args.active_parts
     net._e175_scope = args.scope
     net._e175_k = args.k
+    net._e175_context_from_scalar = bool(getattr(args, "context_from_scalar", False))
     net.forward_four_part_prior = types.MethodType(trainable_tail_forward_four_part_prior, net)
 
 
